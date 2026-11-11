@@ -1,4 +1,7 @@
-use reedline_repl_rs::clap::{Arg, ArgMatches, Command};
+mod dashboard;
+
+use dashboard::DashboardConfig;
+use reedline_repl_rs::clap::{Arg, ArgAction, ArgMatches, Command};
 use reedline_repl_rs::{Repl, Result};
 
 use serde::Deserialize;
@@ -409,6 +412,75 @@ fn cmd_add_scripts(args: ArgMatches, state: &mut AppState) -> Result<Option<Stri
     }
 }
 
+fn dashboard_config_path(state: &AppState) -> std::result::Result<PathBuf, String> {
+    let app_dir = state
+        .tc_json
+        .path()
+        .parent()
+        .ok_or_else(|| format!("Invalid tc.json path: {}", state.tc_json.path().display()))?;
+    Ok(dashboard::config_path(app_dir))
+}
+
+fn cmd_dashboard_config(_args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    let path = match dashboard_config_path(state) {
+        Ok(path) => path,
+        Err(error) => return Ok(Some(format!("Error: {error}"))),
+    };
+
+    match dashboard::ensure_config_file(&path) {
+        Ok(()) => Ok(Some(format!(
+            "Dashboard config: {}\nEdit it in any editor; changes apply live while a dashboard is open.",
+            path.display()
+        ))),
+        Err(error) => Ok(Some(format!("Error: {error}"))),
+    }
+}
+
+fn cmd_dashboard(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    let config_path = match dashboard_config_path(state) {
+        Ok(path) => path,
+        Err(error) => return Ok(Some(format!("Error: {error}"))),
+    };
+    let (settings, watcher) = match dashboard::open_settings(&config_path) {
+        Ok(opened) => opened,
+        Err(error) => return Ok(Some(format!("Error: {error}"))),
+    };
+
+    let interval_override = match args.get_one::<String>("interval_ms") {
+        Some(text) => match dashboard::parse_interval(text) {
+            Ok(interval) => Some(interval),
+            Err(error) => return Ok(Some(format!("Error: {error}"))),
+        },
+        None => None,
+    };
+
+    let source = match dashboard::resolve_source(
+        args.get_flag("demo"),
+        args.get_one::<String>("metrics_path").map(String::as_str),
+        &settings,
+        state.active_script_path.as_deref(),
+    ) {
+        Ok(source) => source,
+        Err(error) => return Ok(Some(format!("Error: {error}"))),
+    };
+
+    let title = match state.active_script_name.as_deref() {
+        Some(name) => format!("Training dashboard - {name}"),
+        None => "Training dashboard".to_string(),
+    };
+
+    match dashboard::run_dashboard(DashboardConfig::new(
+        title,
+        source,
+        settings,
+        watcher,
+        interval_override,
+    )) {
+        Ok(summary) => Ok(Some(summary)),
+        Err(error) => Ok(Some(format!("Error: {error}"))),
+    }
+}
+
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let tc_json = TcJson::load().map_err(std::io::Error::other)?;
     let initial_state = AppState {
@@ -477,6 +549,34 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 .arg(Arg::new("index").required(true).value_name("INDEX"))
                 .about("Delete a script by index from tc.json with confirmation"),
             cmd_remove_script,
+        )
+        .with_command(
+            Command::new("/dashboard")
+                .arg(
+                    Arg::new("metrics_path")
+                        .required(false)
+                        .value_name("ABSOLUTE_PATH")
+                        .help("JSON-lines metrics file (default: metrics.jsonl next to the active script)"),
+                )
+                .arg(
+                    Arg::new("interval_ms")
+                        .long("interval")
+                        .value_name("MS")
+                        .help("Refresh interval in ms (50-60000); overrides the config file"),
+                )
+                .arg(
+                    Arg::new("demo")
+                        .long("demo")
+                        .action(ArgAction::SetTrue)
+                        .help("Show synthetic training data instead of reading a file"),
+                )
+                .about("Open a live dashboard of training metrics (q / Esc / Ctrl+C to exit)"),
+            cmd_dashboard,
+        )
+        .with_command(
+            Command::new("/dashboard_config")
+                .about("Show the dashboard config file path (created with defaults if missing)"),
+            cmd_dashboard_config,
         );
 
     repl.run()?;

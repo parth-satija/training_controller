@@ -3,7 +3,22 @@ name = "training_controller"
 version = "0.1.0"
 edition = "2024"
 
+# The library is what Python imports (`import training_controller`).
+# `cdylib` produces the Python extension module, `rlib` lets the REPL binary
+# and Rust tests use the same code.
+[lib]
+name = "training_controller"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Python bindings are opt-in so `cargo run` / `cargo test` for the REPL
+# never need a Python installation. maturin enables this (see pyproject.toml).
+python = ["dep:pyo3"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reedline-repl-rs = "1.2"
+crossterm = "0.29"
+pyo3 = { version = "0.27", features = ["abi3-py39"], optional = true }
