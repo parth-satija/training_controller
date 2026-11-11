@@ -10,6 +10,9 @@ use std::process::Command as ProcessCommand;
 // Shared state across commands
 struct AppState {
     count: usize,
+    tc_json: TcJson,
+    active_script_name: Option<String>,
+    active_script_path: Option<String>,
 }
 
 pub struct TcJson {
@@ -71,7 +74,62 @@ impl TcJson {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    pub fn scripts(&self) -> Option<&Vec<Value>> {
+        self.document.get("scripts")?.as_array()
+    }
+
+    pub fn add_script(
+        &mut self,
+        name: &str,
+        absolute_path: &str,
+    ) -> std::result::Result<(), String> {
+        if !Path::new(absolute_path).is_absolute() {
+            return Err("Path must be absolute".into());
+        }
+
+        let scripts = self
+            .document
+            .as_object_mut()
+            .ok_or_else(|| "tc.json must contain a JSON object".to_string())?
+            .entry("scripts")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let scripts = scripts
+            .as_array_mut()
+            .ok_or_else(|| "The scripts entry in tc.json must be an array".to_string())?;
+
+        scripts.push(serde_json::json!({
+            "name": name,
+            "path": absolute_path,
+        }));
+
+        self.save()
+    }
+
+    pub fn remove_script(&mut self, index: usize) -> std::result::Result<(String, String), String> {
+        let scripts = self
+            .document
+            .as_object_mut()
+            .ok_or_else(|| "tc.json must contain a JSON object".to_string())?
+            .entry("scripts")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let scripts = scripts
+            .as_array_mut()
+            .ok_or_else(|| "The scripts entry in tc.json must be an array".to_string())?;
+
+        if index >= scripts.len() {
+            return Err(format!("Index {index} out of bounds (0..{}).", scripts.len()));
+        }
+
+        let removed = scripts.remove(index);
+        let name = removed.get("name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let path = removed.get("path").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+
+        self.save()?;
+        Ok((name, path))
+    }
 }
+
 
 fn tc_json_path() -> std::result::Result<PathBuf, String> {
     #[cfg(windows)]
@@ -226,9 +284,139 @@ fn cmd_test_get_terminal_arguments(
     }
 }
 
+fn cmd_show_scripts(_args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    let scripts = match state.tc_json.scripts() {
+        Some(s) => s,
+        None => return Ok(Some("No scripts registered yet.".to_string())),
+    };
+
+    if scripts.is_empty() {
+        return Ok(Some("No scripts registered yet.".to_string()));
+    }
+
+    let mut output = String::from("Registered scripts:\n");
+    for (index, script) in scripts.iter().enumerate() {
+        let name = script.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let path = script.get("path").and_then(|v| v.as_str()).unwrap_or("unknown");
+        output.push_str(&format!("  [{index}] {name} -> {path}\n"));
+    }
+
+    Ok(Some(output.trim_end().to_string()))
+}
+fn cmd_select_script(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    let index_str = args.get_one::<String>("index").unwrap();
+    let index = match index_str.parse::<usize>() {
+        Ok(i) => i,
+        Err(_) => return Ok(Some("Error: Index must be a valid integer.".to_string())),
+    };
+
+    let scripts = match state.tc_json.scripts() {
+        Some(s) => s,
+        None => return Ok(Some("Error: No scripts available.".to_string())),
+    };
+
+    if index >= scripts.len() {
+        return Ok(Some(format!("Error: Index {index} out of bounds (0..{}).", scripts.len())));
+    }
+
+    let script = &scripts[index];
+    let name = script.get("name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    let path = script.get("path").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+
+    state.active_script_name = Some(name.clone());
+    state.active_script_path = Some(path.clone());
+
+    Ok(Some(format!("Selected script [{index}] '{name}' -> {path}")))
+}
+fn cmd_remove_script(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    let index_str = args.get_one::<String>("index").unwrap();
+    let index = match index_str.parse::<usize>() {
+        Ok(i) => i,
+        Err(_) => return Ok(Some("Error: Index must be a valid integer.".to_string())),
+    };
+
+    let scripts = match state.tc_json.scripts() {
+        Some(s) => s,
+        None => return Ok(Some("Error: No scripts available.".to_string())),
+    };
+
+    if index >= scripts.len() {
+        return Ok(Some(format!("Error: Index {index} out of bounds (0..{}).", scripts.len())));
+    }
+
+    let script = &scripts[index];
+    let name = script.get("name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    let path = script.get("path").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+
+    println!("Are you sure you want to delete script [{index}] '{name}' -> {path}? (y/N): ");
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return Ok(Some("Error: Failed to read confirmation input.".to_string()));
+    }
+
+    let trimmed = input.trim().to_lowercase();
+    if trimmed != "y" && trimmed != "yes" {
+        return Ok(Some("Deletion cancelled.".to_string()));
+    }
+
+    match state.tc_json.remove_script(index) {
+        Ok((del_name, del_path)) => {
+            if state.active_script_name.as_deref() == Some(&del_name) {
+                state.active_script_name = None;
+                state.active_script_path = None;
+            }
+            Ok(Some(format!("Successfully deleted script [{index}] '{del_name}' -> {del_path}")))
+        }
+        Err(err) => Ok(Some(format!("Error: {err}"))),
+    }
+}
+
+fn cmd_open_script(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    let name = args.get_one::<String>("name").unwrap();
+
+    let scripts = match state.tc_json.scripts() {
+        Some(s) => s,
+        None => return Ok(Some("Error: No scripts available.".to_string())),
+    };
+
+    let script = scripts.iter().find(|s| {
+        s.get("name").and_then(|v| v.as_str()) == Some(name)
+    });
+
+    let script = match script {
+        Some(s) => s,
+        None => return Ok(Some(format!("Error: Script '{name}' not found."))),
+    };
+
+    let path = script.get("path").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+
+    state.active_script_name = Some(name.clone());
+    state.active_script_path = Some(path.clone());
+
+    Ok(Some(format!("Opened script '{name}' -> {path}")))
+}
+
+fn cmd_add_scripts(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    let name = args.get_one::<String>("name").unwrap();
+    let absolute_path = args.get_one::<String>("absolute_path").unwrap();
+
+    match state.tc_json.add_script(name, absolute_path) {
+        Ok(()) => Ok(Some(format!(
+            "Registered script '{name}' in {}",
+            state.tc_json.path().display()
+        ))),
+        Err(error) => Ok(Some(format!("Error: {error}"))),
+    }
+}
+
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let _tc_json = TcJson::load().map_err(std::io::Error::other)?;
-    let initial_state = AppState { count: 0 };
+    let tc_json = TcJson::load().map_err(std::io::Error::other)?;
+    let initial_state = AppState {
+        count: 0,
+        tc_json,
+        active_script_name: None,
+        active_script_path: None,
+    };
 
     let mut repl = Repl::new(initial_state)
         .with_name("MyInteractiveCLI")
@@ -254,8 +442,102 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 )
                 .about("Test get_terminal_arguments on a Python file"),
             cmd_test_get_terminal_arguments,
+        )
+        .with_command(
+            Command::new("/open_script")
+                .arg(Arg::new("name").required(true).value_name("NAME"))
+                .about("Select a script by name to be the active script"),
+            cmd_open_script,
+        )
+        .with_command(
+            Command::new("/add_scripts")
+                .arg(Arg::new("name").required(true).value_name("NAME"))
+                .arg(
+                    Arg::new("absolute_path")
+                        .required(true)
+                        .value_name("ABSOLUTE_PATH")
+                        .help("Absolute path to the script"),
+                )
+                .about("Register a script in tc.json"),
+            cmd_add_scripts,
+        )
+        .with_command(
+            Command::new("/show_scripts")
+                .about("Show all saved scripts and their paths with an index"),
+            cmd_show_scripts,
+        )
+        .with_command(
+            Command::new("/select_script")
+                .arg(Arg::new("index").required(true).value_name("INDEX"))
+                .about("Select a script by index to be the active script"),
+            cmd_select_script,
+        )
+        .with_command(
+            Command::new("/remove_script")
+                .arg(Arg::new("index").required(true).value_name("INDEX"))
+                .about("Delete a script by index from tc.json with confirmation"),
+            cmd_remove_script,
         );
 
     repl.run()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn add_script_appends_and_saves_script_entry() {
+        let unique_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "training_controller-{}-{unique_id}.json",
+            std::process::id()
+        ));
+        let mut tc_json = TcJson {
+            path: path.clone(),
+            document: serde_json::json!({
+                "scripts": [{"name": "existing", "path": "C:\\scripts\\existing.py"}]
+            }),
+        };
+        let absolute_path = std::env::current_dir()
+            .unwrap()
+            .join("new_script.py")
+            .to_string_lossy()
+            .into_owned();
+
+        tc_json.add_script("new", &absolute_path).unwrap();
+
+        let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["scripts"],
+            serde_json::json!([
+                {"name": "existing", "path": "C:\\scripts\\existing.py"},
+                {"name": "new", "path": absolute_path}
+            ])
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn show_scripts_handles_empty_and_populated_scripts() {
+        let tc_json = TcJson {
+            path: PathBuf::from("unused.json"),
+            document: serde_json::json!({
+                "scripts": [
+                    {"name": "first", "path": "C:\\scripts\\first.py"},
+                    {"name": "second", "path": "C:\\scripts\\second.py"}
+                ]
+            }),
+        };
+
+        let scripts = tc_json.scripts().unwrap();
+        assert_eq!(scripts.len(), 2);
+        assert_eq!(scripts[0]["name"], "first");
+        assert_eq!(scripts[1]["path"], "C:\\scripts\\second.py");
+    }
 }
