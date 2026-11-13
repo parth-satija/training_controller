@@ -1,4 +1,5 @@
 /target
+/target-wsl
 __pycache__/
 *.pyd
 *.so

@@ -9,6 +9,9 @@
 //! * **Rendering** ([`render_frame`], [`sparkline`]) is pure: model in, lines out.
 //! * **Terminal** ([`run_live`]) owns the alternate screen and redraws in place.
 //!
+//! `/dashboard training` is a second view ([`training`]) fed by the Python API
+//! (`init_training_dashboard`, `update_training_dashboard`, `update_hero_text`).
+//!
 //! A training script only has to append JSON lines to a file, for example
 //! `{"step": 10, "loss": 0.42, "accuracy": 0.81}`. Every numeric field becomes
 //! a live series. Everything about how it looks is controlled from the config
@@ -27,6 +30,11 @@ use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
+
+mod training;
+pub use training::{
+    TrainingConfig, TrainingSource, resolve_training_path, run_training_dashboard,
+};
 
 pub const CONFIG_ENV_VAR: &str = "TC_DASHBOARD_CONFIG";
 pub const CONFIG_FILE_NAME: &str = "dashboard.json";
@@ -181,6 +189,8 @@ pub struct ThemeFile {
     pub status_error: StyleFile,
     pub footer: StyleFile,
     pub hint: StyleFile,
+    /// The bold line in the middle of the training dashboard.
+    pub hero: StyleFile,
     /// Series colors, assigned in display order.
     pub palette: Vec<String>,
 }
@@ -195,6 +205,7 @@ impl Default for ThemeFile {
             status_error: StyleFile::new(Some("red"), false, false, false),
             footer: StyleFile::new(None, false, true, false),
             hint: StyleFile::new(None, false, true, false),
+            hero: StyleFile::new(None, true, false, false),
             palette: ["cyan", "green", "yellow", "magenta", "blue", "red"]
                 .iter()
                 .map(|name| name.to_string())
@@ -304,6 +315,7 @@ struct Styles {
     status_error: String,
     footer: String,
     hint: String,
+    hero: String,
 }
 
 #[derive(Debug, Clone)]
@@ -387,6 +399,7 @@ impl Settings {
             status_error: compile_style(&theme.status_error, "theme.status_error")?,
             footer: compile_style(&theme.footer, "theme.footer")?,
             hint: compile_style(&theme.hint, "theme.hint")?,
+            hero: compile_style(&theme.hero, "theme.hero")?,
         };
         if theme.palette.is_empty() {
             return Err("theme.palette needs at least one color.".into());
@@ -632,6 +645,16 @@ impl JsonlTail {
             path,
             offset: 0,
             primed: false,
+        }
+    }
+
+    /// Like [`JsonlTail::new`], but always reads from the first byte instead of
+    /// only the last `BACKFILL_BYTES`. The training view needs the `init` line.
+    pub fn from_start(path: PathBuf) -> Self {
+        Self {
+            path,
+            offset: 0,
+            primed: true,
         }
     }
 
@@ -1302,6 +1325,8 @@ enum Input {
     Timeout,
     Resize,
     Quit,
+    /// Any other key press (used by views that react to keys, e.g. paging).
+    Key(KeyCode),
 }
 
 /// Waits up to `interval` for input, so a keypress never shifts the refresh cadence.
@@ -1324,7 +1349,7 @@ fn wait_for_input(interval: Duration) -> std::result::Result<Input, String> {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(Input::Quit);
                 }
-                _ => {}
+                code => return Ok(Input::Key(code)),
             },
             _ => {}
         }
@@ -1355,7 +1380,16 @@ pub struct Frame {
 /// Generic live loop: calls `frame(width, height)`, paints it, and waits for the
 /// interval it asks for. Returns when the user presses q, Esc or Ctrl+C.
 pub fn run_live(
+    frame: impl FnMut(usize, usize) -> Frame,
+) -> std::result::Result<(), String> {
+    run_live_with_keys(frame, |_| {})
+}
+
+/// [`run_live`] that also reports every key other than q / Esc / Ctrl+C to
+/// `on_key`, then repaints at once so the view reacts immediately.
+pub fn run_live_with_keys(
     mut frame: impl FnMut(usize, usize) -> Frame,
+    mut on_key: impl FnMut(KeyCode),
 ) -> std::result::Result<(), String> {
     let _guard = ScreenGuard::enter()?;
     let mut out = io::stdout();
@@ -1372,6 +1406,7 @@ pub fn run_live(
         match wait_for_input(next.interval)? {
             Input::Quit => return Ok(()),
             Input::Resize => clear = true,
+            Input::Key(code) => on_key(code),
             Input::Timeout => {}
         }
     }

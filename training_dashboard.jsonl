@@ -1,0 +1,103 @@
+{"event":"init","t":1794550636526,"widgets":[{"name":"loss","kind":"curve"},{"name":"val_loss","kind":"curve"},{"name":"accuracy","kind":"graph"},{"name":"lr","kind":"box"}]}
+{"event":"hero","t":1794550636526,"text":"Starting run 'default'..."}
+{"event":"update","t":1794550636526,"values":[1.6796825987322161,1.8628099466642438,0.2365079096671745,0.01]}
+{"event":"hero","t":1794550636526,"text":"Training at Epoch 1/50, step 1, Total Loss at 1.6797"}
+{"event":"update","t":1794550637541,"values":[1.3504804945698474,1.48921804334478,0.38614522974097854,0.01]}
+{"event":"hero","t":1794550637541,"text":"Training at Epoch 2/50, step 2, Total Loss at 1.3505"}
+{"event":"update","t":1794550638561,"values":[1.099051619824506,1.2228707095017264,0.5004310818979518,0.01]}
+{"event":"hero","t":1794550638561,"text":"Training at Epoch 3/50, step 3, Total Loss at 1.0991"}
+{"event":"update","t":1794550639579,"values":[0.933742896528576,1.0449319794436003,0.5755714106688291,0.01]}
+{"event":"hero","t":1794550639579,"text":"Training at Epoch 4/50, step 4, Total Loss at 0.9337"}
+{"event":"update","t":1794550640600,"values":[0.7502360032726488,0.8421281720018722,0.6589836348760687,0.01]}
+{"event":"hero","t":1794550640600,"text":"Training at Epoch 5/50, step 5, Total Loss at 0.7502"}
+{"event":"update","t":1794550641732,"values":[0.6408264498984614,0.7070337994033945,0.708715250046154,0.01]}
+{"event":"hero","t":1794550641732,"text":"Training at Epoch 6/50, step 6, Total Loss at 0.6408"}
+{"event":"update","t":1794550642753,"values":[0.498855461340454,0.5508475439247252,0.7732475175725209,0.01]}
+{"event":"hero","t":1794550642753,"text":"Training at Epoch 7/50, step 7, Total Loss at 0.4989"}
+{"event":"update","t":1794550643773,"values":[0.4452614685169269,0.4956200298584045,0.7976084234013969,0.01]}
+{"event":"hero","t":1794550643773,"text":"Training at Epoch 8/50, step 8, Total Loss at 0.4453"}
+{"event":"update","t":1794550644793,"values":[0.3627446829812658,0.4059662393216646,0.8351160531903338,0.01]}
+{"event":"hero","t":1794550644793,"text":"Training at Epoch 9/50, step 9, Total Loss at 0.3627"}
+{"event":"update","t":1794550645814,"values":[0.3140659489228026,0.3531675217176693,0.8572427504896352,0.01]}
+{"event":"hero","t":1794550645814,"text":"Training at Epoch 10/50, step 10, Total Loss at 0.3141"}
+{"event":"update","t":1794550646836,"values":[0.2632651124833634,0.2931853526220675,0.8803340397802893,0.01]}
+{"event":"hero","t":1794550646836,"text":"Training at Epoch 11/50, step 11, Total Loss at 0.2633"}
+{"event":"update","t":1794550647856,"values":[0.21602384804480967,0.24621509060636843,0.9018073417978137,0.01]}
+{"event":"hero","t":1794550647856,"text":"Training at Epoch 12/50, step 12, Total Loss at 0.2160"}
+{"event":"update","t":1794550648876,"values":[0.16803918389627062,0.19024683484107294,0.9236185527744225,0.01]}
+{"event":"hero","t":1794550648876,"text":"Training at Epoch 13/50, step 13, Total Loss at 0.1680"}
+{"event":"update","t":1794550649898,"values":[0.13420992782656985,0.1571853301125048,0.9389954873515591,0.01]}
+{"event":"hero","t":1794550649898,"text":"Training at Epoch 14/50, step 14, Total Loss at 0.1342"}
+{"event":"update","t":1794550650921,"values":[0.12191695597653701,0.15390516234858354,0.9445832018288468,0.01]}
+{"event":"hero","t":1794550650921,"text":"Training at Epoch 15/50, step 15, Total Loss at 0.1219"}
+{"event":"update","t":1794550651943,"values":[0.10569664054321978,0.12865473575802513,0.9519560724803546,0.01]}
+{"event":"hero","t":1794550651943,"text":"Training at Epoch 16/50, step 16, Total Loss at 0.1057"}
+{"event":"update","t":1794550652970,"values":[0.1038840219167843,0.1270637444924829,0.9527799900378253,0.01]}
+{"event":"hero","t":1794550652971,"text":"Training at Epoch 17/50, step 17, Total Loss at 0.1039"}
+{"event":"update","t":1794550653992,"values":[0.056283997124613856,0.06931691470066297,0.9744163649433574,0.01]}
+{"event":"hero","t":1794550653992,"text":"Training at Epoch 18/50, step 18, Total Loss at 0.0563"}
+{"event":"update","t":1794550655014,"values":[0.0466987500599551,0.061351486140587275,0.9787732954272932,0.01]}
+{"event":"hero","t":1794550655014,"text":"Training at Epoch 19/50, step 19, Total Loss at 0.0467"}
+{"event":"update","t":1794550656036,"values":[0.04449782269875316,0.06774198815291879,0.9797737169551122,0.01]}
+{"event":"hero","t":1794550656036,"text":"Training at Epoch 20/50, step 20, Total Loss at 0.0445"}
+{"event":"update","t":1794550657058,"values":[0.05312802528455937,0.060975732594533906,0.9758508975979275,0.01]}
+{"event":"hero","t":1794550657058,"text":"Training at Epoch 21/50, step 21, Total Loss at 0.0531"}
+{"event":"update","t":1794550658083,"values":[0.03542324656625692,0.0410246095122884,0.983898524288065,0.01]}
+{"event":"hero","t":1794550658083,"text":"Training at Epoch 22/50, step 22, Total Loss at 0.0354"}
+{"event":"update","t":1794550659106,"values":[0.05005009345157907,0.07479808239305458,0.9772499575220095,0.01]}
+{"event":"hero","t":1794550659106,"text":"Training at Epoch 23/50, step 23, Total Loss at 0.0501"}
+{"event":"update","t":1794550660129,"values":[0.05608364134870215,0.07695259397246619,0.97450743575059,0.01]}
+{"event":"hero","t":1794550660129,"text":"Training at Epoch 24/50, step 24, Total Loss at 0.0561"}
+{"event":"update","t":1794550661155,"values":[0.0376013298881904,0.05958951042029011,0.9829084864144589,0.01]}
+{"event":"hero","t":1794550661155,"text":"Training at Epoch 25/50, step 25, Total Loss at 0.0376"}
+{"event":"update","t":1794550662185,"values":[0.015800457408575472,0.025719979869935992,0.992817973905193,0.01]}
+{"event":"hero","t":1794550662185,"text":"Training at Epoch 26/50, step 26, Total Loss at 0.0158"}
+{"event":"update","t":1794550663222,"values":[0.03207658964183377,0.05019722851953147,0.9854197319809846,0.01]}
+{"event":"hero","t":1794550663222,"text":"Training at Epoch 27/50, step 27, Total Loss at 0.0321"}
+{"event":"update","t":1794550664252,"values":[0.03845793433196922,0.048457978349485745,0.9825191207581958,0.01]}
+{"event":"hero","t":1794550664252,"text":"Training at Epoch 28/50, step 28, Total Loss at 0.0385"}
+{"event":"update","t":1794550665285,"values":[0.01883177224660701,0.02144631105685322,0.9914401035242696,0.01]}
+{"event":"hero","t":1794550665285,"text":"Training at Epoch 29/50, step 29, Total Loss at 0.0188"}
+{"event":"update","t":1794550666317,"values":[0.04078668894576165,0.06484465285177698,0.9814605959337447,0.01]}
+{"event":"hero","t":1794550666317,"text":"Training at Epoch 30/50, step 30, Total Loss at 0.0408"}
+{"event":"update","t":1794550667346,"values":[0.034803563403956454,0.03890992470077726,0.9841801984527471,0.01]}
+{"event":"hero","t":1794550667346,"text":"Training at Epoch 31/50, step 31, Total Loss at 0.0348"}
+{"event":"update","t":1794550668377,"values":[0.04789593566041941,0.05505184533091728,0.9782291201543548,0.01]}
+{"event":"hero","t":1794550668377,"text":"Training at Epoch 32/50, step 32, Total Loss at 0.0479"}
+{"event":"update","t":1794550669403,"values":[0.007797270399692318,0.027878004222522724,0.9964557861819581,0.01]}
+{"event":"hero","t":1794550669403,"text":"Training at Epoch 33/50, step 33, Total Loss at 0.0078"}
+{"event":"update","t":1794550670429,"values":[0.037609258528892874,0.04630868394892065,0.9829048824868669,0.01]}
+{"event":"hero","t":1794550670429,"text":"Training at Epoch 34/50, step 34, Total Loss at 0.0376"}
+{"event":"update","t":1794550671455,"values":[0.007645087405503372,0.025015309307663533,0.9965249602702257,0.01]}
+{"event":"hero","t":1794550671455,"text":"Training at Epoch 35/50, step 35, Total Loss at 0.0076"}
+{"event":"update","t":1794550672483,"values":[0.007251909397868719,0.008725704308697404,0.9967036775464233,0.01]}
+{"event":"hero","t":1794550672483,"text":"Training at Epoch 36/50, step 36, Total Loss at 0.0073"}
+{"event":"update","t":1794550673518,"values":[0.039049957453380746,0.04515558591976662,0.9822500193393724,0.01]}
+{"event":"hero","t":1794550673518,"text":"Training at Epoch 37/50, step 37, Total Loss at 0.0390"}
+{"event":"update","t":1794550674546,"values":[0.01033980282658526,0.02061946908470777,0.9953000896242794,0.01]}
+{"event":"hero","t":1794550674546,"text":"Training at Epoch 38/50, step 38, Total Loss at 0.0103"}
+{"event":"update","t":1794550675577,"values":[0.05016077596010888,0.05857840322128761,0.9771996472908596,0.01]}
+{"event":"hero","t":1794550675577,"text":"Training at Epoch 39/50, step 39, Total Loss at 0.0502"}
+{"event":"update","t":1794550676612,"values":[0.018280283919824464,0.03944128464146893,0.9916907800364434,0.01]}
+{"event":"hero","t":1794550676612,"text":"Training at Epoch 40/50, step 40, Total Loss at 0.0183"}
+{"event":"update","t":1794550677642,"values":[0.01072493464451086,0.013177014870965684,0.9951250297070405,0.01]}
+{"event":"hero","t":1794550677642,"text":"Training at Epoch 41/50, step 41, Total Loss at 0.0107"}
+{"event":"update","t":1794550678666,"values":[0.006025311636121106,0.007290070828524735,0.9972612219835814,0.01]}
+{"event":"hero","t":1794550678666,"text":"Training at Epoch 42/50, step 42, Total Loss at 0.0060"}
+{"event":"update","t":1794550679691,"values":[0.039609897061047394,0.04492115045149962,0.9819955013358875,0.01]}
+{"event":"hero","t":1794550679691,"text":"Training at Epoch 43/50, step 43, Total Loss at 0.0396"}
+{"event":"update","t":1794550680716,"values":[0.049563445713565586,0.06534132536543893,0.9774711610392883,0.01]}
+{"event":"hero","t":1794550680716,"text":"Training at Epoch 44/50, step 44, Total Loss at 0.0496"}
+{"event":"update","t":1794550681740,"values":[0.0333873172584879,0.05530947783089968,0.9848239467006873,0.01]}
+{"event":"hero","t":1794550681740,"text":"Training at Epoch 45/50, step 45, Total Loss at 0.0334"}
+{"event":"update","t":1794550682762,"values":[0.046783553728997465,0.07002364864078589,0.9787347483050012,0.01]}
+{"event":"hero","t":1794550682762,"text":"Training at Epoch 46/50, step 46, Total Loss at 0.0468"}
+{"event":"update","t":1794550683782,"values":[0.0484061310532181,0.05664188495249196,0.9779972131576281,0.01]}
+{"event":"hero","t":1794550683782,"text":"Training at Epoch 47/50, step 47, Total Loss at 0.0484"}
+{"event":"update","t":1794550684804,"values":[0.0036581949445157235,0.008474919777760468,0.9983371841161293,0.01]}
+{"event":"hero","t":1794550684804,"text":"Training at Epoch 48/50, step 48, Total Loss at 0.0037"}
+{"event":"update","t":1794550685826,"values":[0.006459469052256007,0.015530208718292351,0.99706387770352,0.01]}
+{"event":"hero","t":1794550685826,"text":"Training at Epoch 49/50, step 49, Total Loss at 0.0065"}
+{"event":"update","t":1794550686850,"values":[0.02154963715890582,0.026759310064302034,0.9902047103823155,0.01]}
+{"event":"hero","t":1794550686850,"text":"Training at Epoch 50/50, step 50, Total Loss at 0.0215"}
+{"event":"hero","t":1794550687871,"text":"Finished 'default': 50 epochs, final loss 0.0215"}
