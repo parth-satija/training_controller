@@ -574,6 +574,44 @@ fn scale_to(value: f64, min: f64, max: f64, span: i64) -> i64 {
     (fraction * span as f64).round() as i64
 }
 
+
+/// Calculate nice tick values for an axis given a range and maximum count.
+fn nice_ticks(min: f64, max: f64, max_ticks: usize) -> Vec<f64> {
+    if min >= max || max_ticks == 0 {
+        return vec![min];
+    }
+    let range = max - min;
+    let target_steps = max_ticks.max(2) - 1;
+    let rough_step = range / target_steps as f64;
+    let magnitude = 10f64.powf(rough_step.log10().floor());
+    let residual = rough_step / magnitude;
+    let nice_residual = if residual <= 1.0 {
+        1.0
+    } else if residual <= 2.0 {
+        2.0
+    } else if residual <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    let step = nice_residual * magnitude;
+
+    let mut ticks = Vec::new();
+    let first_tick = (min / step).ceil() * step;
+    let mut current = first_tick;
+    while current <= max + step * 1e-9 {
+        if current >= min - step * 1e-9 && current <= max + step * 1e-9 {
+            ticks.push(current);
+        }
+        current += step;
+    }
+    if ticks.is_empty() {
+        ticks.push(min);
+        ticks.push(max);
+    }
+    ticks
+}
+
 fn pad_lines(mut lines: Vec<String>, height: usize, width: usize) -> Vec<String> {
     while lines.len() < height {
         lines.push(fit("", width));
@@ -608,18 +646,33 @@ pub fn render_tile(
         None => (0.0, 1.0, 0.0, 1.0),
     };
 
-    let y_labels: [String; 3] = if data_bounds.is_some() {
-        [
-            fmt_axis(y_max),
-            fmt_axis((y_min + y_max) / 2.0),
-            fmt_axis(y_min),
-        ]
+    let (y_ticks, x_ticks) = if data_bounds.is_some() {
+        let max_y_ticks = (plot_rows / 3).clamp(2, 6);
+        let y_t = nice_ticks(y_min, y_max, max_y_ticks);
+        let max_x_ticks = ((width.saturating_sub(10)) / 12).clamp(2, 8);
+        let x_t = nice_ticks(x_min, x_max, max_x_ticks);
+        (y_t, x_t)
     } else {
-        [String::new(), String::new(), String::new()]
+        (vec![y_min, y_max], vec![x_min, x_max])
     };
-    let label_width = y_labels
+
+    // Format all Y tick labels
+    let formatted_y_ticks: Vec<(usize, String)> = if data_bounds.is_some() {
+        y_ticks
+            .iter()
+            .map(|&val| {
+                let r = ((y_max - val) / (y_max - y_min) * (plot_rows as f64 - 1.0)).round() as usize;
+                let r = r.min(plot_rows - 1);
+                (r, fmt_axis(val))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let label_width = formatted_y_ticks
         .iter()
-        .map(|label| label.chars().count())
+        .map(|(_, label)| label.chars().count())
         .max()
         .unwrap_or(1)
         .clamp(3, 10);
@@ -656,15 +709,12 @@ pub fn render_tile(
 
     let waiting_row = plot_rows / 2;
     for row in 0..plot_rows {
-        let (label, tick) = if row == 0 {
-            (y_labels[0].as_str(), '┤')
-        } else if row == plot_rows / 2 {
-            (y_labels[1].as_str(), '┤')
-        } else if row == plot_rows - 1 {
-            (y_labels[2].as_str(), '┤')
-        } else {
-            ("", '│')
-        };
+        let mut label = "";
+        let mut tick = '│';
+        if let Some(pos) = formatted_y_ticks.iter().position(|&(r, _)| r == row) {
+            label = formatted_y_ticks[pos].1.as_str();
+            tick = '┤';
+        }
         let mut line = format!("{}{tick}", fit_right(label, label_width));
         if data_bounds.is_none() {
             if row == waiting_row {
@@ -681,30 +731,45 @@ pub fn render_tile(
         lines.push(line);
     }
 
-    lines.push(format!(
-        "{}└{}",
-        " ".repeat(label_width),
-        "─".repeat(plot_cols)
-    ));
-
-    let mut axis: Vec<char> = vec![' '; plot_cols];
+    let mut axis_line: Vec<char> = vec!['─'; plot_cols];
     if data_bounds.is_some() {
-        let left: Vec<char> = fmt_axis(x_min).chars().collect();
-        let right: Vec<char> = fmt_axis(x_max).chars().collect();
+        for &val in &x_ticks {
+            let col = scale_to(val, x_min, x_max, (plot_cols - 1) as i64) as usize;
+            if col < plot_cols {
+                axis_line[col] = '┬';
+            }
+        }
+    }
+    let axis_str: String = axis_line.into_iter().collect();
+    lines.push(format!("{}└{}", " ".repeat(label_width), axis_str));
+
+    // Build X axis labels line
+    let mut x_labels_row: Vec<char> = vec![' '; plot_cols];
+    if data_bounds.is_some() {
+        for &val in &x_ticks {
+            let col = scale_to(val, x_min, x_max, (plot_cols - 1) as i64) as usize;
+            let label_chars: Vec<char> = fmt_axis(val).chars().collect();
+            let half = label_chars.len() / 2;
+            let start = col.saturating_sub(half);
+            if start + label_chars.len() <= plot_cols {
+                for (i, c) in label_chars.into_iter().enumerate() {
+                    x_labels_row[start + i] = c;
+                }
+            }
+        }
+    } else {
         let name: Vec<char> = x_name.chars().collect();
-        if left.len() + right.len() < plot_cols {
-            axis[..left.len()].copy_from_slice(&left);
-            axis[plot_cols - right.len()..].copy_from_slice(&right);
-            let start = (plot_cols.saturating_sub(name.len())) / 2;
-            if start > left.len() && start + name.len() + 1 < plot_cols - right.len() {
-                axis[start..start + name.len()].copy_from_slice(&name);
+        let start = (plot_cols.saturating_sub(name.len())) / 2;
+        if start + name.len() <= plot_cols {
+            for (i, c) in name.into_iter().enumerate() {
+                x_labels_row[start + i] = c;
             }
         }
     }
     lines.push(format!(
         "{}{}",
         " ".repeat(label_width + 1),
-        axis.into_iter().collect::<String>()
+        x_labels_row.into_iter().collect::<String>()
     ));
 
     if legend_rows == 1 {

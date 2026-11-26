@@ -70,3 +70,7 @@ Wh
 
 * **Questio
 [2026-11-26 19:58] Action completed: I have successfully staged all changes in `D:\training_controller`, committed them with the message "Added SQL Commands", and pushed them to the remot
+[2026-11-26 19:59] Action completed: I have undone the previous push and commit, added `moonbase*` to the `.gitignore` file so all moonbase-related files are ignored, committed the change
+[2026-11-26 20:12] Action completed: I have successfully fixed the compilation errors in `src\graphs.rs` and ensured successful compilation:
+
+1. **Fixed undefined variable reference**: Re
