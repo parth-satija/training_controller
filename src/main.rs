@@ -2,6 +2,8 @@ mod checkpoint_cli;
 mod dashboard;
 mod graphs;
 mod panels;
+mod shell;
+mod venv;
 mod wsl;
 
 use dashboard::{DashboardConfig, TrainingConfig, TrainingSource};
@@ -54,6 +56,15 @@ pub struct LastRun {
     pub config: Option<String>,
     /// The complete argument list the script got.
     pub args: Vec<String>,
+}
+
+/// A shell command line saved by `/save_command` (see `TcJson::save_command`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedCommand {
+    /// The command line as typed, one entry per argument.
+    pub words: Vec<String>,
+    /// Runs in the WSL2 shell instead of the native one.
+    pub wsl: bool,
 }
 
 pub struct TcJson {
@@ -343,6 +354,127 @@ impl TcJson {
             "last_run".to_string(),
             serde_json::json!({ "config": config, "args": args }),
         );
+        self.save()
+    }
+
+    // -- WSL virtualenv switching ---------------------------------------------
+    //
+    // Stored at the top level of tc.json as `"wsl_venv": false`. Missing means
+    // on: WSL runs use the Linux venv next to the script when there is one.
+
+    pub fn wsl_venv(&self) -> bool {
+        self.document
+            .get("wsl_venv")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true)
+    }
+
+    pub fn set_wsl_venv(&mut self, enabled: bool) -> std::result::Result<(), String> {
+        self.document
+            .as_object_mut()
+            .ok_or_else(|| "tc.json must contain a JSON object".to_string())?
+            .insert("wsl_venv".to_string(), Value::Bool(enabled));
+        self.save()
+    }
+
+    // -- Native virtualenv switching --------------------------------------
+    //
+    // Stored at the top level of tc.json as `"native_venv": false`. Missing means
+    // on: native runs and the native shell use the venv next to the script
+    // when there is one (see venv.rs).
+
+    pub fn native_venv(&self) -> bool {
+        self.document
+            .get("native_venv")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true)
+    }
+
+    pub fn set_native_venv(&mut self, enabled: bool) -> std::result::Result<(), String> {
+        self.document
+            .as_object_mut()
+            .ok_or_else(|| "tc.json must contain a JSON object".to_string())?
+            .insert("native_venv".to_string(), Value::Bool(enabled));
+        self.save()
+    }
+
+    // -- Saved shell commands ---------------------------------------------
+    //
+    // Stored at the top level of tc.json (shared by all scripts) as:
+    //   "saved_commands": { "name": { "words": ["pip", "list"], "wsl": false } }
+
+    pub fn saved_commands(&self) -> Vec<(String, SavedCommand)> {
+        let Some(map) = self
+            .document
+            .get("saved_commands")
+            .and_then(Value::as_object)
+        else {
+            return Vec::new();
+        };
+        let mut saved: Vec<(String, SavedCommand)> = map
+            .iter()
+            .filter_map(|(name, value)| {
+                let words: Vec<String> = value
+                    .get("words")?
+                    .as_array()?
+                    .iter()
+                    .map(|word| word.as_str().map(str::to_string))
+                    .collect::<Option<_>>()?;
+                let wsl = value.get("wsl").and_then(Value::as_bool).unwrap_or(false);
+                Some((name.clone(), SavedCommand { words, wsl }))
+            })
+            .collect();
+        saved.sort_by(|left, right| left.0.cmp(&right.0));
+        saved
+    }
+
+    pub fn get_saved_command(&self, name: &str) -> Option<SavedCommand> {
+        self.saved_commands()
+            .into_iter()
+            .find(|(saved_name, _)| saved_name == name)
+            .map(|(_, command)| command)
+    }
+
+    /// Saves (or replaces) a named command line. Returns whether one was replaced.
+    pub fn save_command(
+        &mut self,
+        name: &str,
+        words: &[String],
+        wsl: bool,
+    ) -> std::result::Result<bool, String> {
+        validate_config_name(name).map_err(|error| error.replace("config name", "command name"))?;
+        if words.is_empty() {
+            return Err("Give a command line to save, e.g. /save_command pkgs pip list".to_string());
+        }
+        let object = self
+            .document
+            .as_object_mut()
+            .ok_or_else(|| "tc.json must contain a JSON object".to_string())?;
+        let entry = object
+            .entry("saved_commands")
+            .or_insert_with(|| Value::Object(Default::default()));
+        let map = entry
+            .as_object_mut()
+            .ok_or_else(|| "The saved_commands entry in tc.json must be an object".to_string())?;
+        let replaced = map
+            .insert(
+                name.to_string(),
+                serde_json::json!({ "words": words, "wsl": wsl }),
+            )
+            .is_some();
+        self.save()?;
+        Ok(replaced)
+    }
+
+    pub fn remove_saved_command(&mut self, name: &str) -> std::result::Result<(), String> {
+        let removed = self
+            .document
+            .get_mut("saved_commands")
+            .and_then(Value::as_object_mut)
+            .and_then(|map| map.remove(name));
+        if removed.is_none() {
+            return Err(format!("No saved command '{name}'."));
+        }
         self.save()
     }
 
@@ -916,7 +1048,7 @@ fn prepare_python_module(module_dir: &Path) -> std::result::Result<(), String> {
         module_dir,
         &python_module_file_name(),
         built_library_candidates(),
-        "Run `cargo build --features python` and try again.",
+        "Run `cargo build` and try again.",
     )
 }
 
@@ -1058,10 +1190,22 @@ fn script_command(
     script: &Path,
     script_args: &[String],
     env: &ScriptEnv,
+    use_venv: bool,
 ) -> ProcessCommand {
     let mut command = match target {
         RunTarget::Native => {
-            let mut command = ProcessCommand::new(interpreter);
+            // The venv next to the script (unless /venv off): run its Python and
+            // put it first on PATH, as activating it would.
+            let mut env = env.clone();
+            let venv = use_venv.then(|| venv::venv_for(script)).flatten();
+            let program: std::ffi::OsString = match &venv {
+                Some(venv) => venv::python_in(venv).into_os_string(),
+                None => interpreter.into(),
+            };
+            if let Some(venv) = &venv {
+                venv::activate(&mut env, venv);
+            }
+            let mut command = ProcessCommand::new(program);
             command.arg("-u").arg(script).args(script_args);
             env.apply_native(&mut command);
             if let Some(directory) = script.parent() {
@@ -1070,12 +1214,15 @@ fn script_command(
             command
         }
         RunTarget::Wsl => {
-            let mut command = wsl::script_command(script, script_args);
-            // Activate the venv next to the script: its Python is already the
-            // interpreter, VIRTUAL_ENV makes tools the script starts see it too.
+            let mut command = wsl::script_command(script, script_args, use_venv);
+            // Activate the venv next to the script (unless switched off with
+            // /wsl_venv off): its Python is already the interpreter,
+            // VIRTUAL_ENV makes tools the script starts see it too.
             let mut env = env.clone();
-            if let Some(venv) = wsl::venv_for(script) {
-                env.set("VIRTUAL_ENV", &venv, EnvKind::Path);
+            if use_venv {
+                if let Some(venv) = wsl::venv_for(script) {
+                    env.set("VIRTUAL_ENV", &venv, EnvKind::Path);
+                }
             }
             env.apply_wsl(&mut command);
             command
@@ -1234,9 +1381,11 @@ fn launch_script(
         env.set(logdb::EXPERIMENT_ID_ENV, id.to_string(), EnvKind::Plain);
     }
 
+    let use_venv = venv_enabled(state, target);
+    let venv_note = venv_label(target, script, use_venv);
     let mut not_found: Vec<&str> = Vec::new();
     for interpreter in interpreters(target) {
-        let mut command = script_command(target, interpreter, script, &script_args, &env);
+        let mut command = script_command(target, interpreter, script, &script_args, &env, use_venv);
 
         // The script runs in the background; its output is captured into
         // panels (see /panel) so the REPL stays free.
@@ -1292,7 +1441,7 @@ fn launch_script(
                 };
                 let place = target.place_note();
                 return Ok(Some(format!(
-                    "Script '{name}' {verb}{place} (run #{run_id}{experiment_note}). \
+                    "Script '{name}' {verb}{place} (run #{run_id}{experiment_note}{venv_note}). \
                      View its output with /panel output, /panel error, /panel log or /panel other; \
                      list all panels with /show_active_panels."
                 )));
@@ -1782,6 +1931,135 @@ fn cmd_show_log(args: ArgMatches, state: &mut AppState) -> Result<Option<String>
 }
 
 // ---------------------------------------------------------------------------
+// SQL on one experiment's log (the query engine lives in logdb.rs)
+// ---------------------------------------------------------------------------
+
+/// The experiment a `/sql` command works on.
+struct SqlTarget {
+    db_path: PathBuf,
+    /// Database ID, what the `logdb` functions take.
+    id: i64,
+    /// The experiment ID users see: the number within the active script.
+    seq: i64,
+    script_name: String,
+}
+
+/// Finds experiment `text` (`3`, `#3` or `latest`) of the active script. It
+/// uses the same per-script numbering as `/checkpoints`.
+fn resolve_sql_target(state: &AppState, text: &str) -> std::result::Result<SqlTarget, String> {
+    let (script_name, script_path) = active_script(state)?;
+    let db_path = log_db_path(state).ok_or_else(|| "Invalid tc.json path.".to_string())?;
+    if !db_path.is_file() {
+        return Err(NO_EXPERIMENTS.to_string());
+    }
+    let conn = logdb::open(&db_path)?;
+    let text = text.trim().trim_start_matches('#');
+    let id = if text.eq_ignore_ascii_case("latest") {
+        logdb::latest_script_experiment_id(&conn, &script_name, &script_path)?
+            .ok_or_else(|| format!("'{script_name}' has no experiments yet."))?
+    } else {
+        let seq = text
+            .parse::<i64>()
+            .map_err(|_| "EXPERIMENT_ID must be an integer or 'latest'.".to_string())?;
+        logdb::resolve_experiment(&conn, &script_name, &script_path, seq)?
+            .ok_or_else(|| format!("'{script_name}' has no experiment #{seq}."))?
+    };
+    let seq = logdb::experiment_seq(&conn, id)?.unwrap_or(id);
+    Ok(SqlTarget {
+        db_path,
+        id,
+        seq,
+        script_name,
+    })
+}
+
+fn run_sql_text(
+    state: &AppState,
+    id_text: &str,
+    sql: &str,
+    limit: usize,
+) -> std::result::Result<String, String> {
+    let target = resolve_sql_target(state, id_text)?;
+    let result = logdb::query_experiment_log(&target.db_path, target.id, sql, limit)?;
+    Ok(format!(
+        "Experiment #{} of '{}'\n{}",
+        target.seq,
+        target.script_name,
+        logdb::format_query_result(&result)
+    ))
+}
+
+fn sql_command() -> Command {
+    Command::new("/sql")
+        .arg(
+            Arg::new("id")
+                .required(true)
+                .value_name("EXPERIMENT_ID")
+                .help("Experiment number of the active script, or `latest`"),
+        )
+        .arg(
+            Arg::new("query")
+                .required(true)
+                .num_args(1..)
+                .allow_hyphen_values(true)
+                .value_name("QUERY")
+                .help("[--limit N] SELECT ..."),
+        )
+        .about(
+            "Run a read-only SQL query on one experiment's log. Tables: `wide` (one row per \
+             step, one column per log column), `log` (step, t_ms, time_s, title, value), \
+             `steps`, `cols`. Put the query in double quotes if it contains quotes. \
+             See /sql_schema",
+        )
+}
+
+fn cmd_sql(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    let id_text = args.get_one::<String>("id").unwrap().clone();
+    let words: Vec<String> = args
+        .get_many::<String>("query")
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default();
+    reply(
+        logdb::parse_sql_words(&words)
+            .and_then(|(limit, sql)| run_sql_text(state, &id_text, &sql, limit)),
+    )
+}
+
+fn cmd_sql_file(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    let id_text = args.get_one::<String>("id").unwrap().clone();
+    let file = args.get_one::<String>("file").unwrap().clone();
+    let limit = match args.get_one::<String>("limit") {
+        Some(text) => match text.parse::<usize>() {
+            Ok(limit) if limit > 0 => limit,
+            _ => return Ok(Some("Error: N must be a positive integer.".to_string())),
+        },
+        None => logdb::DEFAULT_QUERY_LIMIT,
+    };
+    let result = fs::read_to_string(&file)
+        .map_err(|error| format!("Failed to read {file}: {error}"))
+        .and_then(|text| {
+            let sql = logdb::normalize_sql(&text);
+            if sql.is_empty() {
+                Err(format!("{file} contains no SQL."))
+            } else {
+                run_sql_text(state, &id_text, &sql, limit)
+            }
+        });
+    reply(result)
+}
+
+fn cmd_sql_schema(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    let id_text = args
+        .get_one::<String>("id")
+        .map_or("latest", String::as_str)
+        .to_string();
+    reply(resolve_sql_target(state, &id_text).and_then(|target| {
+        let conn = logdb::open(&target.db_path)?;
+        logdb::format_sql_schema(&conn, target.id, target.seq)
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Checkpoints (storage and retention live in checkpoint.rs)
 // ---------------------------------------------------------------------------
 
@@ -1833,9 +2111,47 @@ fn cmd_reset_checkpoint_config(_args: ArgMatches, state: &mut AppState) -> Resul
 
 fn cmd_checkpoints(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
     let experiment = args.get_one::<String>("experiment").map(String::as_str);
-    reply(checkpoint_store(state).and_then(|(name, store)| {
-        checkpoint_cli::list(&name, &store, experiment)
-    }))
+    reply(list_checkpoints(state, experiment))
+}
+
+/// Builds the `/checkpoints` text. Users type the experiment ID they see (its
+/// number within the script); checkpoints record the database ID, so the
+/// typed number is resolved first, and database IDs are turned back into the
+/// numbers users see when the rows are printed.
+fn list_checkpoints(
+    state: &AppState,
+    experiment: Option<&str>,
+) -> std::result::Result<String, String> {
+    let (name, store) = checkpoint_store(state)?;
+    let (_, script_path) = active_script(state)?;
+    let conn = match log_db_path(state) {
+        Some(path) if path.is_file() => Some(logdb::open(&path)?),
+        _ => None,
+    };
+
+    let experiment_db_id = match experiment {
+        None => None,
+        Some(text) => {
+            let seq = text
+                .trim()
+                .trim_start_matches('#')
+                .parse::<i64>()
+                .map_err(|_| "EXPERIMENT_ID must be an integer.".to_string())?;
+            let conn = conn.as_ref().ok_or_else(|| NO_EXPERIMENTS.to_string())?;
+            match logdb::resolve_experiment(conn, &name, &script_path, seq)? {
+                Some(id) => Some(id),
+                None => return Err(format!("'{name}' has no experiment #{seq}.")),
+            }
+        }
+    };
+
+    let label = |id: i64| -> String {
+        conn.as_ref()
+            .and_then(|conn| logdb::experiment_seq(conn, id).ok().flatten())
+            .unwrap_or(id)
+            .to_string()
+    };
+    checkpoint_cli::list(&name, &store, experiment_db_id, &label)
 }
 
 fn cmd_pin_checkpoint(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
@@ -2627,9 +2943,10 @@ fn test_on(
         env.set(logdb::DB_FILE_ENV, db, EnvKind::Path);
     }
 
+    let use_venv = venv_enabled(state, target);
     let mut not_found: Vec<&str> = Vec::new();
     for interpreter in interpreters(target) {
-        let mut command = script_command(target, interpreter, script, &script_args, &env);
+        let mut command = script_command(target, interpreter, script, &script_args, &env, use_venv);
 
         match command.spawn() {
             Ok(child) => {
@@ -2722,6 +3039,478 @@ fn cmd_wsl_status(_args: ArgMatches, state: &mut AppState) -> Result<Option<Stri
     }
     lines.push("Run scripts there with /run_wsl, /resume_wsl and /test_wsl.".to_string());
     Ok(Some(lines.join("\n")))
+}
+
+/// `/run_command`: runs a command line in the persistent native shell.
+fn cmd_run_command(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    run_command_on(args, state, RunTarget::Native)
+}
+
+/// `/run_command_wsl`: `/run_command`, but in the persistent WSL2 shell (bash).
+fn cmd_run_command_wsl(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    run_command_on(args, state, RunTarget::Wsl)
+}
+
+/// The key of a target's shell in `shell::with_sessions`.
+fn shell_key(target: RunTarget) -> &'static str {
+    match target {
+        RunTarget::Native => "native",
+        RunTarget::Wsl => "wsl",
+    }
+}
+
+fn shell_kind(target: RunTarget) -> shell::ShellKind {
+    if target == RunTarget::Native && cfg!(windows) {
+        shell::ShellKind::PowerShell
+    } else {
+        shell::ShellKind::Posix
+    }
+}
+
+/// Opens the shell of a target: PowerShell natively on Windows (`pwsh` when
+/// installed, else `powershell.exe`), `bash` (else `sh`) natively on Linux or
+/// macOS, including a controller that itself runs inside WSL, and `bash` in
+/// WSL2 for the `_wsl` commands. It starts in the active script's folder with
+/// the same environment a script gets, and in WSL it activates the venv next
+/// to the script unless `/wsl_venv off`.
+fn start_shell(state: &AppState, target: RunTarget) -> std::result::Result<shell::Session, String> {
+    let workdir: Option<PathBuf> = state
+        .active_script_path
+        .as_deref()
+        .and_then(|path| Path::new(path).parent())
+        .map(Path::to_path_buf);
+
+    let python_path = python_path_for(state, target)?;
+    let mut env = ScriptEnv::new();
+    env.set("PYTHONPATH", &python_path, EnvKind::PathList);
+    env.set("PYTHONUNBUFFERED", "1", EnvKind::Plain);
+    env.set("PYTHONIOENCODING", "utf-8", EnvKind::Plain);
+    if let Some(name) = state.active_script_name.as_deref() {
+        if let Ok(directory) = checkpoint_dir_for(state, name) {
+            env.set(checkpoint::DIR_ENV, directory, EnvKind::Path);
+        }
+    }
+    if let Some(db) = log_db_path(state) {
+        env.set(logdb::DB_FILE_ENV, db, EnvKind::Path);
+    }
+
+    let started_for = state.active_script_path.clone();
+    match target {
+        RunTarget::Native => {
+            // Activate the venv next to the script (unless /venv off). Through the
+            // environment, so it needs no Activate.ps1 and works in bash too.
+            if state.tc_json.native_venv() {
+                if let Some(venv) = workdir.as_deref().and_then(venv::venv_in) {
+                    venv::activate(&mut env, &venv);
+                }
+            }
+            let kind = shell_kind(target);
+            let start = |program: &str, program_args: &[&str], init: &[String]| {
+                let mut command = ProcessCommand::new(program);
+                command.args(program_args);
+                env.apply_native(&mut command);
+                if let Some(directory) = &workdir {
+                    command.current_dir(directory);
+                }
+                shell::Session::start(kind, command, &state.panels, init, started_for.clone())
+            };
+            if cfg!(windows) {
+                let args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"];
+                // UTF-8 output without a byte-order mark, so non-ASCII text is
+                // not garbled in the panels.
+                let init = vec![
+                    "try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}"
+                        .to_string(),
+                ];
+                start("pwsh", &args, &init).or_else(|_| start("powershell.exe", &args, &init))
+            } else {
+                start("bash", &[], &[]).or_else(|_| start("sh", &[], &[]))
+            }
+        }
+        RunTarget::Wsl => {
+            let mut command = wsl::command_for(workdir.as_deref(), "bash", &[], false);
+            env.apply_wsl(&mut command);
+            let mut init = Vec::new();
+            if state.tc_json.wsl_venv() {
+                if let Some(venv) = workdir.as_deref().and_then(wsl::venv_in) {
+                    init.push(format!(
+                        "source {}/bin/activate",
+                        shell::posix_quote(&wsl::to_wsl_path(&venv.to_string_lossy()))
+                    ));
+                }
+            }
+            shell::Session::start(shell_kind(target), command, &state.panels, &init, started_for)
+        }
+    }
+}
+
+/// `/run_command COMMAND...`: sends a command line to the target's persistent
+/// shell (opened on first use). The shell stays open, so `cd`, `set` /
+/// `export` and an activated venv carry over to the next command. Output goes
+/// to the panels like a script's, and the run ends with the command's exit
+/// code. See shell.rs.
+fn run_command_on(
+    args: ArgMatches,
+    state: &mut AppState,
+    target: RunTarget,
+) -> Result<Option<String>> {
+    let words = collect_args(&args);
+    if words.is_empty() {
+        return Ok(Some("Error: Give a command to run, e.g. /run_command pip list".to_string()));
+    }
+    run_words_on(words, state, target)
+}
+
+/// Sends an already split command line to a target's persistent shell. Shared
+/// by `/run_command`, `/run_command_wsl` and `/run_saved`.
+fn run_words_on(
+    words: Vec<String>,
+    state: &mut AppState,
+    target: RunTarget,
+) -> Result<Option<String>> {
+    let key = shell_key(target);
+    let place = match target {
+        RunTarget::Native => "native",
+        RunTarget::Wsl => "WSL2",
+    };
+    let command_line = shell::join_command(&words, shell_kind(target));
+
+    let mut notes: Vec<String> = Vec::new();
+    let alive = shell::with_sessions(|sessions| {
+        sessions.iter().any(|(k, session)| *k == key && session.is_alive())
+    });
+    let mut just_started = false;
+    if !alive {
+        let session = match start_shell(state, target) {
+            Ok(session) => session,
+            Err(error) => return Ok(Some(format!("Error: {error}"))),
+        };
+        shell::with_sessions(|sessions| {
+            sessions.retain(|(k, _)| *k != key);
+            sessions.push((key, session));
+        });
+        just_started = true;
+        notes.push(format!(
+            "Opened a new {place} shell. It stays open (cd, variables and an activated venv carry over) \
+             until you run /restart_shell or leave the controller."
+        ));
+    }
+
+    if just_started {
+        if let Some(venv) = shell_venv_name(state, target) {
+            notes.push(format!(
+                "Activated venv '{venv}' next to the script (turn it off with /venv off or /wsl_venv off)."
+            ));
+        }
+    }
+
+    let hub = state.panels.clone();
+    let current_script = state.active_script_path.clone();
+    let mut label = format!("command: {command_line}");
+    if target == RunTarget::Wsl {
+        label.push_str(" [wsl]");
+    }
+    let outcome = shell::with_sessions(|sessions| {
+        let (_, session) = sessions.iter_mut().find(|(k, _)| *k == key)?;
+        let other_script = session.started_for() != current_script.as_deref();
+        Some((session.run(&hub, &label, &command_line), other_script))
+    });
+    let Some((result, other_script)) = outcome else {
+        return Ok(Some("Error: The shell is not available.".to_string()));
+    };
+    let (run_id, ahead) = match result {
+        Ok(started) => started,
+        Err(error) => return Ok(Some(format!("Error: {error}"))),
+    };
+
+    if ahead > 0 {
+        notes.push(format!(
+            "It waits for the {ahead} command(s) still running in this shell; \
+             commands in one shell run one after another."
+        ));
+    }
+    if other_script && !just_started {
+        notes.push(
+            "This shell was opened for another script (its folder and environment). \
+             Run /restart_shell to start it again for the active script."
+                .to_string(),
+        );
+    }
+    let mut message = format!("Sent to the {place} shell (run #{run_id}): {command_line}");
+    for note in notes {
+        message.push('\n');
+        message.push_str(&note);
+    }
+    message.push_str(
+        "\nView its output with /panel output, /panel error, /panel log or /panel other; \
+         list all panels with /show_active_panels.",
+    );
+    Ok(Some(message))
+}
+
+// -- Saved commands ----------------------------------------------------------
+//
+// `/save_command NAME COMMAND...` stores a command line in tc.json so it can be
+// run again later with `/run_saved NAME`, also after restarting the controller.
+
+fn save_command_def(name: &'static str, about: &'static str) -> Command {
+    Command::new(name)
+        .arg(Arg::new("name").required(true).value_name("NAME"))
+        .arg(
+            Arg::new("args")
+                .num_args(1..)
+                .required(true)
+                .allow_hyphen_values(true)
+                .value_name("COMMAND [ARGS...]")
+                .help("The command line to store, e.g. cd sub && pip list"),
+        )
+        .about(about)
+}
+
+fn target_label(wsl: bool) -> &'static str {
+    if wsl { "WSL2" } else { "native" }
+}
+
+fn save_command_on(args: ArgMatches, state: &mut AppState, wsl: bool) -> Result<Option<String>> {
+    let name = args.get_one::<String>("name").unwrap();
+    let words = collect_args(&args);
+    match state.tc_json.save_command(name, &words, wsl) {
+        Ok(replaced) => Ok(Some(format!(
+            "{} command '{name}' ({}): {}\nRun it with: /run_saved {name}",
+            if replaced { "Replaced" } else { "Saved" },
+            target_label(wsl),
+            format_args_display(&words)
+        ))),
+        Err(error) => Ok(Some(format!("Error: {error}"))),
+    }
+}
+
+/// `/save_command NAME COMMAND...`: stores a command for the native shell.
+fn cmd_save_command(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    save_command_on(args, state, false)
+}
+
+/// `/save_command_wsl NAME COMMAND...`: stores a command for the WSL2 shell.
+fn cmd_save_command_wsl(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    save_command_on(args, state, true)
+}
+
+/// `/saved_commands [NAME]`: lists the stored commands (or shows one).
+fn cmd_saved_commands(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    if let Some(name) = args.get_one::<String>("name") {
+        return Ok(Some(match state.tc_json.get_saved_command(name) {
+            Some(saved) => format!(
+                "{name} [{}]: {}",
+                target_label(saved.wsl),
+                format_args_display(&saved.words)
+            ),
+            None => format!("Error: No saved command '{name}'."),
+        }));
+    }
+
+    let saved = state.tc_json.saved_commands();
+    if saved.is_empty() {
+        return Ok(Some(
+            "No saved commands. Save one with /save_command NAME COMMAND...".to_string(),
+        ));
+    }
+    let width = saved.iter().map(|(name, _)| name.chars().count()).max().unwrap_or(0);
+    let mut lines = vec!["Saved commands:".to_string()];
+    for (name, command) in &saved {
+        lines.push(format!(
+            "  {name:<width$}  [{}]  {}",
+            target_label(command.wsl),
+            format_args_display(&command.words)
+        ));
+    }
+    lines.push("Run one with /run_saved NAME [extra arguments].".to_string());
+    Ok(Some(lines.join("\n")))
+}
+
+/// `/run_saved NAME [ARGS...]`: runs a stored command in the shell it was saved
+/// for, with any extra typed arguments added at the end.
+fn cmd_run_saved(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    let name = args.get_one::<String>("name").unwrap();
+    let Some(saved) = state.tc_json.get_saved_command(name) else {
+        return Ok(Some(format!(
+            "Error: No saved command '{name}'. List them with /saved_commands."
+        )));
+    };
+    let mut words = saved.words;
+    words.extend(collect_args(&args));
+    let target = if saved.wsl { RunTarget::Wsl } else { RunTarget::Native };
+    run_words_on(words, state, target)
+}
+
+/// `/remove_saved_command NAME`: deletes a stored command, with confirmation.
+fn cmd_remove_saved_command(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    let name = args.get_one::<String>("name").unwrap();
+    let Some(saved) = state.tc_json.get_saved_command(name) else {
+        return Ok(Some(format!("Error: No saved command '{name}'.")));
+    };
+    let prompt = format!(
+        "Are you sure you want to delete saved command '{name}' ({})?",
+        format_args_display(&saved.words)
+    );
+    match confirm(&prompt) {
+        Ok(true) => {}
+        Ok(false) => return Ok(Some("Deletion cancelled.".to_string())),
+        Err(error) => return Ok(Some(format!("Error: {error}"))),
+    }
+    reply(
+        state
+            .tc_json
+            .remove_saved_command(name)
+            .map(|()| format!("Deleted saved command '{name}'.")),
+    )
+}
+
+/// `/restart_shell [native|wsl|all]`: closes the persistent shell(s); the next
+/// `/run_command` opens a fresh one.
+fn cmd_restart_shell(args: ArgMatches, _state: &mut AppState) -> Result<Option<String>> {
+    let which = args.get_one::<String>("which").map(|text| text.to_lowercase());
+    let keys: Vec<&str> = match which.as_deref() {
+        None | Some("all") => vec!["native", "wsl"],
+        Some("native") => vec!["native"],
+        Some("wsl") => vec!["wsl"],
+        Some(_) => {
+            return Ok(Some("Error: Use /restart_shell [native|wsl|all].".to_string()));
+        }
+    };
+    let closed = shell::with_sessions(|sessions| {
+        let before = sessions.len();
+        // Dropping a session kills its shell.
+        sessions.retain(|(key, _)| !keys.contains(key));
+        before - sessions.len()
+    });
+    Ok(Some(if closed == 0 {
+        "No shell was open. The next /run_command opens a new one.".to_string()
+    } else {
+        format!(
+            "Closed {closed} shell(s). The next /run_command or /run_command_wsl opens a new one \
+             for the active script."
+        )
+    }))
+}
+
+/// The `/run_command` and `/run_command_wsl` commands. Hyphenated words belong
+/// to the command line and are passed through untouched.
+fn run_command_def(name: &'static str, about: &'static str) -> Command {
+    Command::new(name)
+        .arg(
+            Arg::new("args")
+                .num_args(1..)
+                .required(true)
+                .allow_hyphen_values(true)
+                .value_name("COMMAND [ARGS...]")
+                .help("The command line for the shell, e.g. cd sub && pip list"),
+        )
+        .about(about)
+}
+
+/// `/wsl_venv [on|off]`: whether WSL runs switch into the venv next to the script.
+fn cmd_wsl_venv(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    let describe = |enabled: bool| {
+        if enabled {
+            "on: WSL runs use the Linux venv (.venv, venv or env, in that order of priority) next to the script when there is one"
+        } else {
+            "off: WSL runs use the default Python (python3)"
+        }
+    };
+    let Some(mode) = args.get_one::<String>("mode") else {
+        return Ok(Some(format!(
+            "WSL venv switching is {}.\nChange it with /wsl_venv on or /wsl_venv off. \
+             The {} environment variable overrides the interpreter either way.",
+            describe(state.tc_json.wsl_venv()),
+            wsl::PYTHON_ENV
+        )));
+    };
+    let enabled = match mode.to_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => true,
+        "off" | "false" | "no" | "0" => false,
+        _ => return Ok(Some("Error: Use /wsl_venv on or /wsl_venv off.".to_string())),
+    };
+    match state.tc_json.set_wsl_venv(enabled) {
+        Ok(()) => Ok(Some(format!(
+            "WSL venv switching is now {}.\nThe open WSL shell (if any) picks it up after /restart_shell wsl.",
+            describe(enabled)
+        ))),
+        Err(error) => Ok(Some(format!("Error: {error}"))),
+    }
+}
+
+/// Whether runs for `target` switch into the venv next to the script.
+fn venv_enabled(state: &AppState, target: RunTarget) -> bool {
+    match target {
+        RunTarget::Native => state.tc_json.native_venv(),
+        RunTarget::Wsl => state.tc_json.wsl_venv(),
+    }
+}
+
+/// ", venv: NAME" for the "started" message when a run uses a venv, else "".
+fn venv_label(target: RunTarget, script: &Path, use_venv: bool) -> String {
+    if !use_venv {
+        return String::new();
+    }
+    let venv = match target {
+        RunTarget::Native => venv::venv_for(script),
+        RunTarget::Wsl => wsl::venv_for(script),
+    };
+    match venv.and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned())) {
+        Some(name) => format!(", venv: {name}"),
+        None => String::new(),
+    }
+}
+
+/// The name of the venv a new shell for the active script activates, if any.
+fn shell_venv_name(state: &AppState, target: RunTarget) -> Option<String> {
+    let folder = state
+        .active_script_path
+        .as_deref()
+        .and_then(|path| Path::new(path).parent())?;
+    let venv = match target {
+        RunTarget::Native => state
+            .tc_json
+            .native_venv()
+            .then(|| venv::venv_in(folder))
+            .flatten(),
+        RunTarget::Wsl => state
+            .tc_json
+            .wsl_venv()
+            .then(|| wsl::venv_in(folder))
+            .flatten(),
+    }?;
+    venv.file_name().map(|name| name.to_string_lossy().into_owned())
+}
+
+/// `/venv [on|off]`: whether native runs and the native shell switch into the
+/// venv next to the script (the native counterpart of `/wsl_venv`).
+fn cmd_venv(args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
+    let describe = |enabled: bool| {
+        if enabled {
+            "on: /run_script, /test and /run_command use the venv (.venv, venv or env, in that order of priority) next to the script when there is one"
+        } else {
+            "off: native runs use the default Python on PATH"
+        }
+    };
+    let Some(mode) = args.get_one::<String>("mode") else {
+        return Ok(Some(format!(
+            "Venv switching is {}.\nChange it with /venv on or /venv off. For WSL see /wsl_venv.",
+            describe(state.tc_json.native_venv())
+        )));
+    };
+    let enabled = match mode.to_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => true,
+        "off" | "false" | "no" | "0" => false,
+        _ => return Ok(Some("Error: Use /venv on or /venv off.".to_string())),
+    };
+    match state.tc_json.set_native_venv(enabled) {
+        Ok(()) => Ok(Some(format!(
+            "Venv switching is now {}.\nThe open native shell (if any) picks it up after /restart_shell native.",
+            describe(enabled)
+        ))),
+        Err(error) => Ok(Some(format!("Error: {error}"))),
+    }
 }
 
 fn cmd_help_ping(_args: ArgMatches, state: &mut AppState) -> Result<Option<String>> {
@@ -3161,6 +3950,28 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             cmd_wsl_status,
         )
         .with_command(
+            Command::new("/venv")
+                .arg(
+                    Arg::new("mode")
+                        .required(false)
+                        .value_name("on|off")
+                        .help("Switch into the venv next to the script for native runs (omit to show the setting)"),
+                )
+                .about("Turn the automatic native virtualenv switching on or off (saved in tc.json)"),
+            cmd_venv,
+        )
+        .with_command(
+            Command::new("/wsl_venv")
+                .arg(
+                    Arg::new("mode")
+                        .required(false)
+                        .value_name("on|off")
+                        .help("Switch into the venv next to the script for WSL runs (omit to show the setting)"),
+                )
+                .about("Turn the automatic WSL virtualenv switching on or off (saved in tc.json)"),
+            cmd_wsl_venv,
+        )
+        .with_command(
             Command::new("/add_config")
                 .arg(Arg::new("name").required(true).value_name("NAME"))
                 .arg(
@@ -3262,6 +4073,41 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 )
                 .about("Show the logged values of an experiment"),
             cmd_show_log,
+        )
+        .with_command(sql_command(), cmd_sql)
+        .with_command(
+            Command::new("/sql_file")
+                .arg(
+                    Arg::new("id")
+                        .required(true)
+                        .value_name("EXPERIMENT_ID")
+                        .help("Experiment number of the active script, or `latest`"),
+                )
+                .arg(
+                    Arg::new("file")
+                        .required(true)
+                        .value_name("FILE")
+                        .help("A file with one SQL query (use / in paths)"),
+                )
+                .arg(
+                    Arg::new("limit")
+                        .long("limit")
+                        .value_name("N")
+                        .help("Show at most N rows (default: 100)"),
+                )
+                .about("Run the SQL query in a file on one experiment's log (read-only)"),
+            cmd_sql_file,
+        )
+        .with_command(
+            Command::new("/sql_schema")
+                .arg(
+                    Arg::new("id")
+                        .required(false)
+                        .value_name("EXPERIMENT_ID")
+                        .help("Experiment number of the active script (default: latest)"),
+                )
+                .about("Show the tables and log columns that /sql can query for an experiment"),
+            cmd_sql_schema,
         )
         .with_command(graph_command(), cmd_graph)
         .with_command(
@@ -3520,7 +4366,71 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             cmd_select_associate_config,
         )
         .with_command(test_command(), cmd_test)
-        .with_command(test_wsl_command(), cmd_test_wsl);
+        .with_command(test_wsl_command(), cmd_test_wsl)
+        .with_command(
+            run_command_def(
+                "/run_command",
+                "Run a command in the persistent native shell (venv activated unless /venv off; cd, variables stay between commands; output goes to /panel)",
+            ),
+            cmd_run_command,
+        )
+        .with_command(
+            run_command_def(
+                "/run_command_wsl",
+                "Run a command in the persistent WSL2 shell (bash, venv activated unless /wsl_venv off; output goes to /panel)",
+            ),
+            cmd_run_command_wsl,
+        )
+        .with_command(
+            Command::new("/restart_shell")
+                .arg(
+                    Arg::new("which")
+                        .required(false)
+                        .value_name("native|wsl|all")
+                        .help("Which shell to close (default: all)"),
+                )
+                .about("Close the persistent shell(s); the next /run_command opens a fresh one"),
+            cmd_restart_shell,
+        )
+        .with_command(
+            save_command_def(
+                "/save_command",
+                "Store a command line under NAME (native shell) to run later with /run_saved",
+            ),
+            cmd_save_command,
+        )
+        .with_command(
+            save_command_def(
+                "/save_command_wsl",
+                "Store a command line under NAME for the WSL2 shell",
+            ),
+            cmd_save_command_wsl,
+        )
+        .with_command(
+            Command::new("/saved_commands")
+                .arg(Arg::new("name").required(false).value_name("NAME"))
+                .about("List the stored commands (or show one by name)"),
+            cmd_saved_commands,
+        )
+        .with_command(
+            Command::new("/run_saved")
+                .arg(Arg::new("name").required(true).value_name("NAME"))
+                .arg(
+                    Arg::new("args")
+                        .num_args(0..)
+                        .allow_hyphen_values(true)
+                        .value_name("EXTRA ARGS")
+                        .help("Added to the end of the stored command line"),
+                )
+                .about("Run a stored command in the shell it was saved for (output goes to /panel)"),
+            cmd_run_saved,
+        )
+        .with_command(
+            Command::new("/remove_saved_command")
+                .arg(Arg::new("name").required(true).value_name("NAME"))
+                .about("Delete a stored command, with confirmation"),
+            cmd_remove_saved_command,
+        );
 
     repl.run()?;
     Ok(())
@@ -3543,6 +4453,56 @@ mod tests {
             )),
             document,
         }
+    }
+
+    #[test]
+    fn venv_switching_defaults_to_on_and_is_saved() {
+        let mut tc = temp_tc_json(serde_json::json!({}));
+        assert!(tc.native_venv());
+        tc.set_native_venv(false).unwrap();
+        assert!(!tc.native_venv());
+        let saved: Value = serde_json::from_slice(&fs::read(tc.path()).unwrap()).unwrap();
+        assert_eq!(saved["native_venv"], false);
+        // Independent of the WSL setting.
+        assert!(tc.wsl_venv());
+        fs::remove_file(tc.path()).unwrap();
+    }
+
+    #[test]
+    fn saved_commands_are_stored_replaced_and_removed() {
+        let mut tc = temp_tc_json(serde_json::json!({}));
+        assert!(tc.saved_commands().is_empty());
+
+        let words: Vec<String> = ["pip", "list"].iter().map(|word| word.to_string()).collect();
+        assert!(!tc.save_command("pkgs", &words, false).unwrap());
+        // Saving the same name again replaces it.
+        assert!(tc.save_command("pkgs", &words, true).unwrap());
+        tc.save_command("a", &["ls".to_string()], false).unwrap();
+
+        let names: Vec<String> = tc.saved_commands().into_iter().map(|(name, _)| name).collect();
+        assert_eq!(names, vec!["a", "pkgs"]);
+        assert_eq!(
+            tc.get_saved_command("pkgs"),
+            Some(SavedCommand { words: words.clone(), wsl: true })
+        );
+        assert!(tc.get_saved_command("nope").is_none());
+
+        // Bad names and empty command lines are rejected.
+        assert!(tc.save_command("bad name", &words, false).is_err());
+        assert!(tc.save_command("-x", &words, false).is_err());
+        assert!(tc.save_command("empty", &[], false).is_err());
+
+        // Persisted in tc.json, so it survives a restart.
+        let saved: Value = serde_json::from_slice(&fs::read(tc.path()).unwrap()).unwrap();
+        assert_eq!(saved["saved_commands"]["pkgs"]["wsl"], true);
+        assert_eq!(saved["saved_commands"]["pkgs"]["words"], serde_json::json!(["pip", "list"]));
+
+        tc.remove_saved_command("pkgs").unwrap();
+        assert!(tc.remove_saved_command("pkgs").is_err());
+        assert!(tc.get_saved_command("pkgs").is_none());
+        assert_eq!(tc.saved_commands().len(), 1);
+
+        fs::remove_file(tc.path()).unwrap();
     }
 
     #[test]

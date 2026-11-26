@@ -12,8 +12,11 @@ path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# Python bindings are opt-in so `cargo run` / `cargo test` for the REPL
-# never need a Python installation. maturin enables this (see pyproject.toml).
+# The Python bindings are on by default, so a plain `cargo build` / `cargo run`
+# produces the module that scripts import. This needs a Python installation at
+# build time. To build the REPL and run tests without Python, pass
+# `--no-default-features`. maturin enables `python` explicitly (see pyproject.toml).
+default = ["python"]
 python = ["dep:pyo3"]
 
 [dependencies]

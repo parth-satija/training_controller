@@ -32,12 +32,16 @@
 //! * `log_view`: the three log tables joined, handy for ad-hoc SQL:
 //!   `SELECT step, title, value FROM log_view WHERE experiment_id = 3`
 //!
+//! `/sql` queries do not run on this file: they run on a private in-memory
+//! copy of one experiment's log, see [`query_experiment_log`].
+//!
 //! Both the controller and the script open the file at the same time, so it
 //! uses WAL mode and a busy timeout.
 //!
 //! This module uses no PyO3 types, so it is tested with plain `cargo test`.
 
 use crate::api::now_ms;
+use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
 use std::path::Path;
@@ -782,6 +786,278 @@ pub fn resolve_experiment(
 }
 
 // ---------------------------------------------------------------------------
+// SQL on one experiment's log (the controller side)
+// ---------------------------------------------------------------------------
+//
+// `/sql` lets the user query the log of a single experiment. The query does not
+// run on `logs.db`: the controller copies that one experiment into a private
+// in-memory database, detaches the real file, and runs the query there, against
+//
+// * `wide(step, time_s, <one column per log column>)`: one row per step
+// * `log(step, t_ms, time_s, title, value)`: one row per logged value
+// * `steps(step, t_ms, time_s)` and `cols(idx, title)`: the copied tables
+//
+// So a query can neither see another experiment nor change anything, and
+// nothing it does can reach `logs.db`. Only `SELECT` / `WITH` / `VALUES`
+// statements that SQLite itself reports as read-only are accepted.
+
+/// Rows `/sql` shows when `--limit` is not given.
+pub const DEFAULT_QUERY_LIMIT: usize = 100;
+
+/// The result of [`query_experiment_log`], already turned into text cells.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    /// `true` when the query produced more rows than the limit.
+    pub truncated: bool,
+}
+
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// The names the log columns have in the `wide` view. `step` and `time_s` are
+/// taken and SQLite compares names without regard to case, so a title that
+/// clashes gets `_` appended until it is unique (`step` -> `step_`).
+pub fn wide_column_names(titles: &[String]) -> Vec<String> {
+    let mut taken: Vec<String> = vec!["step".to_string(), "time_s".to_string()];
+    titles
+        .iter()
+        .map(|title| {
+            let mut name = title.clone();
+            while taken.iter().any(|used| used.eq_ignore_ascii_case(&name)) {
+                name.push('_');
+            }
+            taken.push(name.clone());
+            name
+        })
+        .collect()
+}
+
+fn wide_view_sql(titles: &[String]) -> String {
+    let mut sql = String::from("CREATE VIEW wide AS SELECT s.step AS step, s.time_s AS time_s");
+    for (idx, name) in wide_column_names(titles).iter().enumerate() {
+        sql.push_str(&format!(
+            ", (SELECT v.value FROM vals v WHERE v.step = s.step AND v.col = {idx}) AS {}",
+            quote_identifier(name)
+        ));
+    }
+    sql.push_str(" FROM steps s");
+    sql
+}
+
+/// The first SQL keyword of a statement, upper case, after any comments.
+fn first_keyword(sql: &str) -> String {
+    let mut rest = sql.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.split_once('\n').map_or("", |(_, tail)| tail).trim_start();
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/").map_or("", |(_, tail)| tail).trim_start();
+        } else {
+            break;
+        }
+    }
+    rest.chars()
+        .take_while(|ch| ch.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+/// Trims a query and drops its trailing semicolons.
+pub fn normalize_sql(text: &str) -> String {
+    text.trim().trim_end_matches(';').trim().to_string()
+}
+
+/// Splits the words typed after `/sql ID` into the row limit and the query:
+/// `[--limit N] SELECT ...`.
+pub fn parse_sql_words(words: &[String]) -> Result<(usize, String), String> {
+    let (limit, rest) = match words.first().map(String::as_str) {
+        Some("--limit") => {
+            let value = words.get(1).ok_or("--limit needs a number, e.g. --limit 20.")?;
+            let limit = value
+                .parse::<usize>()
+                .ok()
+                .filter(|limit| *limit > 0)
+                .ok_or_else(|| format!("--limit must be a positive integer, got '{value}'."))?;
+            (limit, &words[2..])
+        }
+        _ => (DEFAULT_QUERY_LIMIT, words),
+    };
+    let sql = normalize_sql(&rest.join(" "));
+    if sql.is_empty() {
+        return Err("Missing SQL query. Example: /sql 3 SELECT step, loss FROM wide LIMIT 5".into());
+    }
+    Ok((limit, sql))
+}
+
+/// Copies one experiment into a fresh in-memory database and builds the views
+/// `/sql` queries use. The real database file is detached again before this
+/// returns, and the connection is read-only.
+fn scoped_copy(db_path: &Path, experiment_id: i64) -> Result<Connection, String> {
+    let titles = {
+        let source = open(db_path)?;
+        if !experiment_exists(&source, experiment_id)? {
+            return Err(format!("Experiment #{experiment_id} does not exist."));
+        }
+        log_columns(&source, experiment_id)?
+    };
+    let path = db_path
+        .to_str()
+        .ok_or_else(|| format!("The log database path is not valid text: {}", db_path.display()))?;
+
+    let conn = Connection::open_in_memory().map_err(err("Failed to open the query database"))?;
+    conn.busy_timeout(BUSY_TIMEOUT)
+        .map_err(err("Failed to open the query database"))?;
+    conn.execute("ATTACH DATABASE ?1 AS src", [path])
+        .map_err(err("Failed to read the log database"))?;
+    conn.execute_batch(&format!(
+        "BEGIN;
+         CREATE TABLE steps (step INTEGER PRIMARY KEY, t_ms INTEGER NOT NULL, time_s REAL NOT NULL);
+         CREATE TABLE cols (idx INTEGER PRIMARY KEY, title TEXT NOT NULL);
+         CREATE TABLE vals (step INTEGER NOT NULL, col INTEGER NOT NULL, value REAL,
+                            PRIMARY KEY (step, col));
+         INSERT INTO steps SELECT step, t_ms, time_s FROM src.log_steps WHERE experiment_id = {experiment_id};
+         INSERT INTO cols SELECT idx, title FROM src.log_columns WHERE experiment_id = {experiment_id};
+         INSERT INTO vals SELECT step, col, value FROM src.log_values WHERE experiment_id = {experiment_id};
+         COMMIT;"
+    ))
+    .map_err(err("Failed to copy the experiment log"))?;
+    conn.execute_batch("DETACH DATABASE src")
+        .map_err(err("Failed to close the log database"))?;
+    conn.execute_batch(
+        "CREATE VIEW log AS
+         SELECT v.step AS step, s.t_ms AS t_ms, s.time_s AS time_s, c.title AS title, v.value AS value
+         FROM vals v JOIN steps s ON s.step = v.step JOIN cols c ON c.idx = v.col",
+    )
+    .map_err(err("Failed to prepare the query database"))?;
+    conn.execute_batch(&wide_view_sql(&titles))
+        .map_err(err("Failed to prepare the query database"))?;
+    conn.execute_batch("PRAGMA query_only = ON;")
+        .map_err(err("Failed to prepare the query database"))?;
+    Ok(conn)
+}
+
+fn run_query(conn: &Connection, sql: &str, limit: usize) -> Result<QueryResult, String> {
+    let sql_error = |error: rusqlite::Error| format!("SQL error: {error}");
+    let mut statement = conn.prepare(sql).map_err(sql_error)?;
+    if !statement.readonly() {
+        return Err("Only read-only queries are allowed.".to_string());
+    }
+    let columns: Vec<String> = statement
+        .column_names()
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect();
+
+    let mut rows = statement.query([]).map_err(sql_error)?;
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut truncated = false;
+    while let Some(row) = rows.next().map_err(sql_error)? {
+        if out.len() >= limit {
+            truncated = true;
+            break;
+        }
+        let mut cells = Vec::with_capacity(columns.len());
+        for index in 0..columns.len() {
+            let cell = match row.get_ref(index).map_err(sql_error)? {
+                ValueRef::Null => "NULL".to_string(),
+                ValueRef::Integer(value) => value.to_string(),
+                ValueRef::Real(value) => format_value(Some(value)),
+                ValueRef::Text(text) => String::from_utf8_lossy(text).replace(['\n', '\r'], " "),
+                ValueRef::Blob(blob) => format!("<blob {} bytes>", blob.len()),
+            };
+            cells.push(cell);
+        }
+        out.push(cells);
+    }
+    Ok(QueryResult {
+        columns,
+        rows: out,
+        truncated,
+    })
+}
+
+/// Runs a read-only query on the log of one experiment (database ID) and
+/// returns at most `limit` rows. See the notes above for what it can see.
+pub fn query_experiment_log(
+    db_path: &Path,
+    experiment_id: i64,
+    sql: &str,
+    limit: usize,
+) -> Result<QueryResult, String> {
+    let keyword = first_keyword(sql);
+    if !matches!(keyword.as_str(), "SELECT" | "WITH" | "VALUES") {
+        let found = if keyword.is_empty() {
+            sql.chars().take(12).collect::<String>()
+        } else {
+            keyword
+        };
+        return Err(format!(
+            "Only read-only queries are allowed: start with SELECT or WITH (got '{found}')."
+        ));
+    }
+    let conn = scoped_copy(db_path, experiment_id)?;
+    run_query(&conn, sql, limit)
+}
+
+/// Text for `/sql_schema`: what `/sql` can query for this experiment.
+/// `seq` is the experiment ID users see (shown in the examples).
+pub fn format_sql_schema(conn: &Connection, experiment_id: i64, seq: i64) -> Result<String, String> {
+    let titles = log_columns(conn, experiment_id)?;
+    let steps: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM log_steps WHERE experiment_id = ?1",
+            [experiment_id],
+            |row| row.get(0),
+        )
+        .map_err(err("Failed to read the log"))?;
+    let mut wide = vec!["step".to_string(), "time_s".to_string()];
+    wide.extend(wide_column_names(&titles));
+
+    let mut text = format!(
+        "/sql on experiment #{seq} ({steps} step(s)) can query:\n  \
+         wide   one row per step: {}\n  \
+         log    one row per value: step, t_ms, time_s, title, value\n  \
+         steps  step, t_ms, time_s\n  \
+         cols   idx, title\n\
+         NaN and infinite values are NULL.",
+        wide.join(", ")
+    );
+    if titles.is_empty() {
+        text.push_str("\nThe script has not called init_log yet, so `wide` has only step and time_s.");
+    }
+    let first = titles.first().map_or("loss", String::as_str);
+    text.push_str(&format!(
+        "\nExamples:\n  /sql {seq} SELECT step, time_s FROM wide ORDER BY step DESC LIMIT 5\n  \
+         /sql {seq} \"SELECT step, value FROM log WHERE title = '{first}' ORDER BY value LIMIT 5\"\n\
+         Put the query in double quotes when it contains quotes. Add --limit N after the ID for more rows."
+    ));
+    Ok(text)
+}
+
+/// Text for `/sql` results.
+pub fn format_query_result(result: &QueryResult) -> String {
+    if result.columns.is_empty() {
+        return "The query returned no columns.".to_string();
+    }
+    if result.rows.is_empty() {
+        return format!("{}\n(no rows)", render_table(&result.columns, &[]));
+    }
+    let mut text = render_table(&result.columns, &result.rows);
+    let count = result.rows.len();
+    if result.truncated {
+        text.push_str(&format!(
+            "\n(showing the first {count} rows; there are more, use --limit N to see more)"
+        ));
+    } else {
+        text.push_str(&format!("\n({count} row{})", if count == 1 { "" } else { "s" }));
+    }
+    text
+}
+
+// ---------------------------------------------------------------------------
 // Text output for the REPL (pure)
 // ---------------------------------------------------------------------------
 
@@ -937,6 +1213,188 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    // ----- /sql -----
+
+    fn temp_db(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "training_controller-sql-{label}-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ))
+    }
+
+    fn remove_db(path: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.to_path_buf().into_os_string();
+            file.push(suffix);
+            let _ = fs::remove_file(file);
+        }
+    }
+
+    /// A database file with two experiments of the same script: the first logs
+    /// `loss` and `acc` (3 steps, one NaN), the second logs `other` (1 step).
+    fn sql_fixture(label: &str) -> (std::path::PathBuf, i64, i64) {
+        let path = temp_db(label);
+        let conn = open(&path).unwrap();
+        let first = new_experiment(&conn, "train");
+        let second = new_experiment(&conn, "train");
+        let mut writer = LogWriter::init(conn, first, strings(&["loss", "acc"])).unwrap();
+        writer.log(&[0.5, 0.1]).unwrap();
+        writer.log(&[0.25, 0.2]).unwrap();
+        writer.log(&[f64::NAN, 0.3]).unwrap();
+        let conn = writer.into_connection();
+        let mut writer = LogWriter::init(conn, second, strings(&["other"])).unwrap();
+        writer.log(&[9.0]).unwrap();
+        (path, first, second)
+    }
+
+    #[test]
+    fn sql_reads_the_wide_view() {
+        let (path, first, _) = sql_fixture("wide");
+        let all = query_experiment_log(&path, first, "SELECT step, loss, acc FROM wide ORDER BY step", 100)
+            .unwrap();
+        assert_eq!(all.columns, strings(&["step", "loss", "acc"]));
+        assert_eq!(all.rows[0], strings(&["0", "0.5", "0.1"]));
+        assert_eq!(all.rows[2], strings(&["2", "NULL", "0.3"]));
+        assert!(!all.truncated);
+
+        let low = query_experiment_log(&path, first, "SELECT step FROM wide WHERE loss < 0.4", 100).unwrap();
+        assert_eq!(low.rows, vec![strings(&["1"])]);
+        remove_db(&path);
+    }
+
+    #[test]
+    fn sql_reads_the_long_log_view() {
+        let (path, first, _) = sql_fixture("long");
+        let result = query_experiment_log(
+            &path,
+            first,
+            "SELECT title, COUNT(value), MIN(value) FROM log GROUP BY title ORDER BY title",
+            100,
+        )
+        .unwrap();
+        assert_eq!(result.rows[0], strings(&["acc", "3", "0.1"]));
+        // The NaN step is NULL, which COUNT(value) skips.
+        assert_eq!(result.rows[1], strings(&["loss", "2", "0.25"]));
+        remove_db(&path);
+    }
+
+    #[test]
+    fn sql_only_sees_the_chosen_experiment() {
+        let (path, first, second) = sql_fixture("scope");
+        let count = |id: i64, sql: &str| {
+            query_experiment_log(&path, id, sql, 10).unwrap().rows[0][0].clone()
+        };
+        assert_eq!(count(first, "SELECT COUNT(*) FROM log"), "6");
+        assert_eq!(count(first, "SELECT COUNT(*) FROM steps"), "3");
+        assert_eq!(count(second, "SELECT COUNT(*) FROM log"), "1");
+        assert_eq!(count(second, "SELECT title FROM cols"), "other");
+
+        // The real tables are not reachable.
+        for sql in [
+            "SELECT * FROM log_values",
+            "SELECT * FROM experiments",
+            "SELECT * FROM src.log_values",
+        ] {
+            let error = query_experiment_log(&path, first, sql, 10).unwrap_err();
+            assert!(error.contains("SQL error"), "{sql}: {error}");
+        }
+        remove_db(&path);
+    }
+
+    #[test]
+    fn sql_rejects_anything_but_reading() {
+        let (path, first, _) = sql_fixture("readonly");
+        for sql in [
+            "DELETE FROM steps",
+            "DROP TABLE vals",
+            "INSERT INTO steps VALUES (9, 9, 9)",
+            "ATTACH 'other.db' AS other",
+            "PRAGMA query_only = OFF",
+            "SELECT 1; DROP TABLE steps",
+        ] {
+            assert!(query_experiment_log(&path, first, sql, 10).is_err(), "{sql}");
+        }
+        let error = query_experiment_log(&path, first, "DELETE FROM steps", 10).unwrap_err();
+        assert!(error.contains("read-only"), "{error}");
+        // The experiment is untouched.
+        let count = query_experiment_log(&path, first, "SELECT COUNT(*) FROM steps", 10).unwrap();
+        assert_eq!(count.rows[0][0], "3");
+        remove_db(&path);
+    }
+
+    #[test]
+    fn sql_limits_rows_and_reports_errors() {
+        let (path, first, _) = sql_fixture("limit");
+        let two = query_experiment_log(&path, first, "SELECT step FROM wide ORDER BY step", 2).unwrap();
+        assert_eq!(two.rows.len(), 2);
+        assert!(two.truncated);
+        assert!(format_query_result(&two).contains("showing the first 2 rows"));
+        let three = query_experiment_log(&path, first, "SELECT step FROM wide ORDER BY step", 3).unwrap();
+        assert!(!three.truncated);
+        assert!(format_query_result(&three).ends_with("(3 rows)"));
+        let none = query_experiment_log(&path, first, "SELECT step FROM wide WHERE step > 99", 3).unwrap();
+        assert!(format_query_result(&none).ends_with("(no rows)"));
+
+        let missing = query_experiment_log(&path, 999, "SELECT 1", 5).unwrap_err();
+        assert!(missing.contains("#999 does not exist"), "{missing}");
+        let syntax = query_experiment_log(&path, first, "SELECT FROM wide", 5).unwrap_err();
+        assert!(syntax.contains("SQL error"), "{syntax}");
+        remove_db(&path);
+    }
+
+    #[test]
+    fn sql_words_and_column_names_are_parsed() {
+        assert_eq!(
+            parse_sql_words(&strings(&["SELECT", "1;"])).unwrap(),
+            (DEFAULT_QUERY_LIMIT, "SELECT 1".to_string())
+        );
+        assert_eq!(
+            parse_sql_words(&strings(&["--limit", "5", "SELECT", "*", "FROM", "wide"])).unwrap(),
+            (5, "SELECT * FROM wide".to_string())
+        );
+        assert!(parse_sql_words(&strings(&["--limit"])).is_err());
+        assert!(parse_sql_words(&strings(&["--limit", "0", "SELECT", "1"])).is_err());
+        assert!(parse_sql_words(&strings(&[";"])).unwrap_err().contains("Missing SQL"));
+
+        assert_eq!(first_keyword("  -- note\n/* x */ select 1"), "SELECT");
+        assert_eq!(first_keyword(""), "");
+
+        assert_eq!(
+            wide_column_names(&strings(&["loss", "Step", "time_s", "LOSS"])),
+            strings(&["loss", "Step_", "time_s_", "LOSS_"])
+        );
+
+        // A log column named like a built-in column is still reachable.
+        let path = temp_db("clash");
+        let conn = open(&path).unwrap();
+        let id = new_experiment(&conn, "train");
+        let mut writer = LogWriter::init(conn, id, strings(&["step", "time_s"])).unwrap();
+        writer.log(&[7.0, 8.0]).unwrap();
+        let result = query_experiment_log(
+            &path,
+            id,
+            "SELECT step, time_s, step_, time_s_ FROM wide",
+            10,
+        )
+        .unwrap();
+        assert_eq!(result.rows[0], strings(&["0", "0", "7", "8"]));
+        drop(writer);
+        remove_db(&path);
+    }
+
+    #[test]
+    fn sql_schema_lists_what_can_be_queried() {
+        let (path, first, _) = sql_fixture("schema");
+        let conn = open(&path).unwrap();
+        let text = format_sql_schema(&conn, first, 1).unwrap();
+        assert!(text.contains("experiment #1 (3 step(s))"), "{text}");
+        assert!(text.contains("wide   one row per step: step, time_s, loss, acc"), "{text}");
+        assert!(text.contains("/sql 1 SELECT step, time_s FROM wide"), "{text}");
+        drop(conn);
+        remove_db(&path);
     }
 
     #[test]

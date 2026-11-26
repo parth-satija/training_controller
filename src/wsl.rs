@@ -203,34 +203,63 @@ fn python_command(workdir: Option<&Path>, python: &str) -> Command {
     command
 }
 
+/// Gives a `wsl.exe` process its own hidden console on Windows (a no-op
+/// elsewhere). By default it shares the controller's console, and what runs
+/// inside WSL can switch that console into raw / virtual-terminal input mode,
+/// leaving the REPL with arrow keys typed as `^[[A` and a dead Enter and
+/// Backspace. Every `wsl.exe` the controller starts should go through this.
+pub fn hide_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
 /// The Python to use when nothing more specific applies: `TC_WSL_PYTHON` or `python3`.
 fn default_python() -> String {
     env_value(PYTHON_ENV).unwrap_or_else(|| DEFAULT_PYTHON.to_string())
 }
 
-/// Folder names searched for a Linux virtualenv in the script's folder.
-pub const VENV_DIR_NAMES: [&str; 3] = ["venv", ".venv", "env"];
+/// Folder names searched for a Linux virtualenv in the script's folder, in
+/// priority order: if several exist, the first one that is usable wins
+/// (`.venv` before `venv` before `env`).
+pub const VENV_DIR_NAMES: [&str; 3] = [".venv", "venv", "env"];
 
 /// The Linux virtualenv in the script's folder, if there is one.
 ///
-/// A Linux venv has `pyvenv.cfg` and a `bin` folder; a Windows venv has
-/// `Scripts` instead and is skipped. (Only existence is checked from the
-/// Windows side: the `bin/python` symlink may not be readable there.)
+/// A Linux venv has `pyvenv.cfg`, a `bin` folder and `bin/activate`; a Windows
+/// venv has `Scripts` instead and is skipped, and so is a hollow folder that
+/// lacks `bin/activate` (a leftover `venv` must not hide a real `.venv`).
+/// Candidates are tried in [`VENV_DIR_NAMES`] order. (Only existence is checked
+/// from the Windows side: the `bin/python` symlink may not be readable there.)
 pub fn venv_for(script: &Path) -> Option<std::path::PathBuf> {
-    let folder = script.parent()?;
+    venv_in(script.parent()?)
+}
+
+/// The Linux virtualenv directly inside `folder`, if there is one (see [`venv_for`]).
+pub fn venv_in(folder: &Path) -> Option<std::path::PathBuf> {
     VENV_DIR_NAMES
         .iter()
         .map(|name| folder.join(name))
-        .find(|venv| venv.join("pyvenv.cfg").is_file() && venv.join("bin").is_dir())
+        .find(|venv| {
+            venv.join("pyvenv.cfg").is_file()
+                && venv.join("bin").is_dir()
+                && venv.join("bin").join("activate").is_file()
+        })
 }
 
 /// The Python for a script, as a WSL path or command name. Order: the
-/// `TC_WSL_PYTHON` override, the virtualenv next to the script, `python3`.
-pub fn python_for(script: &Path) -> String {
+/// `TC_WSL_PYTHON` override, the virtualenv next to the script (only when
+/// `use_venv` is true), `python3`.
+pub fn python_for(script: &Path, use_venv: bool) -> String {
     if let Some(python) = env_value(PYTHON_ENV) {
         return python;
     }
-    match venv_for(script) {
+    match use_venv.then(|| venv_for(script)).flatten() {
         Some(venv) => format!("{}/bin/python", to_wsl_path(&venv.to_string_lossy())),
         None => DEFAULT_PYTHON.to_string(),
     }
@@ -238,12 +267,42 @@ pub fn python_for(script: &Path) -> String {
 
 /// The process that runs `script` with `script_args` inside WSL, started in
 /// the script's folder. Environment and stdio are up to the caller.
-pub fn script_command(script: &Path, script_args: &[String]) -> Command {
-    let mut command = python_command(script.parent(), &python_for(script));
+pub fn script_command(script: &Path, script_args: &[String], use_venv: bool) -> Command {
+    let mut command = python_command(script.parent(), &python_for(script, use_venv));
     command
         .arg("-u")
         .arg(to_wsl_path(&script.to_string_lossy()))
         .args(script_args);
+    hide_console(&mut command);
+    command
+}
+
+/// The process that runs an arbitrary `program` with `args` inside WSL,
+/// started in `workdir`. No shell is involved, so shell syntax (pipes, `~`,
+/// `&&`) does not work; arguments arrive untouched and are not path-translated.
+///
+/// With `use_venv`, a bare command name (`python`, `pip`, ...) that exists in the
+/// Linux virtualenv inside `workdir` runs from that venv. Environment and stdio
+/// are up to the caller.
+pub fn command_for(
+    workdir: Option<&Path>,
+    program: &str,
+    args: &[String],
+    use_venv: bool,
+) -> Command {
+    let bare = !program.contains('/') && !program.contains('\\');
+    let program = match workdir.filter(|_| use_venv && bare).and_then(venv_in) {
+        Some(venv)
+            if matches!(program, "python" | "python3")
+                || venv.join("bin").join(program).exists() =>
+        {
+            format!("{}/bin/{program}", to_wsl_path(&venv.to_string_lossy()))
+        }
+        _ => program.to_string(),
+    };
+    let mut command = python_command(workdir, &program);
+    command.args(args);
+    hide_console(&mut command);
     command
 }
 
@@ -292,6 +351,7 @@ fn run_python(env: &ScriptEnv, code: &str) -> Result<String, String> {
     let mut command = python_command(None, &default_python());
     command.arg("-c").arg(code).stdin(Stdio::null());
     env.apply_wsl(&mut command);
+    hide_console(&mut command);
 
     let output = command.output().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -400,6 +460,7 @@ mod tests {
         let command = script_command(
             Path::new(r"D:\runs\train.py"),
             &["--epochs".to_string(), "5".to_string()],
+            true,
         );
         assert_eq!(command.get_program(), OsStr::new(WSL_EXE));
 
@@ -414,6 +475,54 @@ mod tests {
             &args[args.len() - 4..],
             &["-u", "/mnt/d/runs/train.py", "--epochs", "5"]
         );
+    }
+
+    #[test]
+    fn an_arbitrary_command_runs_through_wsl_exec() {
+        let command = command_for(
+            Some(Path::new(r"D:\runs")),
+            "pip",
+            &["list".to_string()],
+            true,
+        );
+        assert_eq!(command.get_program(), OsStr::new(WSL_EXE));
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert!(args.windows(2).any(|pair| pair == ["--cd", "/mnt/d/runs"]));
+        assert_eq!(&args[args.len() - 3..], &["--exec", "pip", "list"]);
+    }
+
+    fn fake_venv(folder: &Path, name: &str, with_activate: bool) {
+        let bin = folder.join(name).join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(folder.join(name).join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        if with_activate {
+            std::fs::write(bin.join("activate"), "").unwrap();
+        }
+    }
+
+    #[test]
+    fn dot_venv_wins_over_venv_and_env_and_hollow_venvs_are_skipped() {
+        let root = std::env::temp_dir().join(format!("tc_venv_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        fake_venv(&root, "env", true);
+        assert_eq!(venv_in(&root), Some(root.join("env")));
+        fake_venv(&root, "venv", true);
+        assert_eq!(venv_in(&root), Some(root.join("venv")));
+        fake_venv(&root, ".venv", true);
+        assert_eq!(venv_in(&root), Some(root.join(".venv")));
+
+        // A hollow `.venv` (no bin/activate) is skipped in favour of the next one.
+        let _ = std::fs::remove_dir_all(root.join(".venv"));
+        fake_venv(&root, ".venv", false);
+        assert_eq!(venv_in(&root), Some(root.join("venv")));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

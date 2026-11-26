@@ -23,7 +23,9 @@
 //! ([`PanelStore`]) and rendering ([`render_panel`]) are pure and tested;
 //! [`attach_child`] and [`open_panel`] do the I/O.
 
-use crate::dashboard::{fit, fmt_duration, run_live, Frame};
+use crate::dashboard::{fit, fmt_duration, run_live_with_keys, Frame};
+use crossterm::event::KeyCode;
+use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, BufRead, BufReader, IsTerminal, Read};
 use std::process::Child;
@@ -317,6 +319,15 @@ impl PanelStore {
         self.panels.contains_key(name)
     }
 
+    /// The text of every line of a panel, oldest first (for tests).
+    #[cfg(test)]
+    pub fn lines_of(&self, name: &str) -> Vec<String> {
+        self.panels
+            .get(name)
+            .map(|panel| panel.lines.iter().map(|line| line.text.clone()).collect())
+            .unwrap_or_default()
+    }
+
     pub fn line_count(&self, name: &str) -> usize {
         self.panels.get(name).map_or(0, |panel| panel.lines.len())
     }
@@ -461,18 +472,49 @@ fn pad_frame(mut lines: Vec<String>, height: usize, width: usize) -> Vec<String>
     lines
 }
 
+/// Number of screen rows a panel occupies when drawn `width` columns wide
+/// (a terminal of `width` columns draws `width - 1` characters per row).
+/// Matches [`wrap_rows`]: an empty line still takes one row.
+pub fn panel_total_rows(store: &PanelStore, name: &str, width: usize) -> usize {
+    let w = width.saturating_sub(1).max(1);
+    store.panels.get(name).map_or(0, |panel| {
+        panel
+            .lines
+            .iter()
+            .map(|line| line.text.chars().count().div_ceil(w).max(1))
+            .sum()
+    })
+}
+
 /// Builds exactly `height` lines, each at most `width - 1` visible characters.
 /// The view follows the end of the panel, like `tail -f`.
 pub fn render_panel(store: &PanelStore, name: &str, width: usize, height: usize) -> Vec<String> {
+    render_panel_scrolled(store, name, width, height, 0).0
+}
+
+/// Like [`render_panel`], but `scroll` is how many rows the view is moved up
+/// from the end of the panel (0 follows the end). Returns the frame and the
+/// scroll that was actually applied, which is `scroll` limited so the first
+/// row of the panel is the highest the view can go.
+pub fn render_panel_scrolled(
+    store: &PanelStore,
+    name: &str,
+    width: usize,
+    height: usize,
+    scroll: usize,
+) -> (Vec<String>, usize) {
     let w = width.saturating_sub(1).max(1);
     if width < MIN_VIEW_WIDTH || height < MIN_VIEW_HEIGHT {
-        return pad_frame(
-            vec![fit(
-                &format!(" Terminal too small (need {MIN_VIEW_WIDTH}x{MIN_VIEW_HEIGHT})"),
+        return (
+            pad_frame(
+                vec![fit(
+                    &format!(" Terminal too small (need {MIN_VIEW_WIDTH}x{MIN_VIEW_HEIGHT})"),
+                    w,
+                )],
+                height,
                 w,
-            )],
-            height,
-            w,
+            ),
+            0,
         );
     }
 
@@ -486,24 +528,35 @@ pub fn render_panel(store: &PanelStore, name: &str, width: usize, height: usize)
     } else {
         ""
     };
+    let body_rows = height - 2;
+    let total_rows = panel_total_rows(store, name, width);
+    let scroll = scroll.min(total_rows.saturating_sub(body_rows));
+    let scrolled = if scroll > 0 {
+        format!("  ·  ↑ {scroll} rows above the end (End = follow)")
+    } else {
+        String::new()
+    };
     let header = format!(
-        " Panel: {name}  ·  {}{seen}{running}",
+        " Panel: {name}  ·  {}{seen}{running}{scrolled}",
         plural(store.line_count(name), "line")
     );
 
-    let body_rows = height - 2;
     let mut rows: Vec<(String, LineStyle)> = Vec::new();
     if let Some(panel) = store.panels.get(name) {
-        // Collect wrapped rows from the end until the screen is full.
+        // Collect wrapped rows from the end until the screen (plus the rows
+        // scrolled past) is full.
+        let want = body_rows + scroll;
         for line in panel.lines.iter().rev() {
             for piece in wrap_rows(&line.text, w).into_iter().rev() {
                 rows.push((piece, line.style));
             }
-            if rows.len() >= body_rows {
+            if rows.len() >= want {
                 break;
             }
         }
         rows.reverse();
+        // Drop the newest `scroll` rows, then keep the last screenful.
+        rows.truncate(rows.len().saturating_sub(scroll));
         let skip = rows.len().saturating_sub(body_rows);
         rows.drain(..skip);
     }
@@ -518,8 +571,13 @@ pub fn render_panel(store: &PanelStore, name: &str, width: usize, height: usize)
     while lines.len() < height - 1 {
         lines.push(fit("", w));
     }
-    lines.push(paint(&fit(" q / Esc / Ctrl+C to exit  ·  live", w), "2"));
-    pad_frame(lines, height, w)
+    let footer = if scroll > 0 {
+        " q / Esc / Ctrl+C to exit  ·  ↑↓ PgUp PgDn Home End scroll  ·  paused at scroll position"
+    } else {
+        " q / Esc / Ctrl+C to exit  ·  ↑↓ PgUp PgDn Home End scroll  ·  live"
+    };
+    lines.push(paint(&fit(footer, w), "2"));
+    (pad_frame(lines, height, w), scroll)
 }
 
 // ---------------------------------------------------------------------------
@@ -547,7 +605,7 @@ impl PanelHub {
 }
 
 /// Reads lines until the stream ends, routing each into the hub.
-fn pump<R: Read>(reader: R, hub: PanelHub) {
+pub(crate) fn pump<R: Read>(reader: R, hub: PanelHub) {
     let mut reader = BufReader::new(reader);
     let mut buffer = Vec::new();
     loop {
@@ -618,10 +676,43 @@ pub fn open_panel(hub: &PanelHub, name: &str) -> std::result::Result<String, Str
         return Err("Panels need an interactive terminal.".to_string());
     }
 
-    run_live(|width, height| Frame {
-        lines: hub.with(|store| render_panel(store, name, width, height)),
-        interval: VIEW_INTERVAL,
-    })?;
+    // Rows the view is scrolled up from the end (0 = follow the output).
+    let scroll = Cell::new(0usize);
+    // Total rows at the previous repaint, so a scrolled view stays put while
+    // new output arrives instead of sliding along with it.
+    let last_total = Cell::new(0usize);
+    let page = Cell::new(MIN_VIEW_HEIGHT);
+
+    run_live_with_keys(
+        |width, height| {
+            let (lines, total, applied) = hub.with(|store| {
+                let total = panel_total_rows(store, name, width);
+                let mut offset = scroll.get();
+                if offset > 0 {
+                    offset = offset.saturating_add(total.saturating_sub(last_total.get()));
+                }
+                let (lines, applied) = render_panel_scrolled(store, name, width, height, offset);
+                (lines, total, applied)
+            });
+            last_total.set(total);
+            scroll.set(applied);
+            page.set(height.saturating_sub(3).max(1));
+            Frame {
+                lines,
+                interval: VIEW_INTERVAL,
+            }
+        },
+        |key| match key {
+            KeyCode::Up | KeyCode::Char('k') => scroll.set(scroll.get().saturating_add(1)),
+            KeyCode::Down | KeyCode::Char('j') => scroll.set(scroll.get().saturating_sub(1)),
+            KeyCode::PageUp => scroll.set(scroll.get().saturating_add(page.get())),
+            KeyCode::PageDown => scroll.set(scroll.get().saturating_sub(page.get())),
+            // Clamped to the top of the panel on the next repaint.
+            KeyCode::Home | KeyCode::Char('g') => scroll.set(usize::MAX),
+            KeyCode::End | KeyCode::Char('G') => scroll.set(0),
+            _ => {}
+        },
+    )?;
     Ok(format!("Closed panel '{name}'."))
 }
 
@@ -888,6 +979,51 @@ mod tests {
 
         let tiny = render_panel(&store, OUTPUT_PANEL, 10, 2);
         assert_eq!(tiny.len(), 2);
+    }
+
+    #[test]
+    fn render_panel_scrolls_back_through_older_output() {
+        let mut store = PanelStore::new();
+        for index in 0..50 {
+            store.ingest(&format!("line {index}"));
+        }
+        let view = |scroll: usize| -> (Vec<String>, usize) {
+            let (lines, applied) = render_panel_scrolled(&store, OUTPUT_PANEL, 80, 10, scroll);
+            (lines.iter().map(|line| strip_ansi(line)).collect(), applied)
+        };
+
+        // Scroll 0 is the same as following the end.
+        let (text, applied) = view(0);
+        assert_eq!(applied, 0);
+        assert!(text[1].starts_with("line 42") && text[8].starts_with("line 49"));
+        assert!(!text[0].contains("above the end"));
+
+        // Scrolling up by 5 shows older lines and says so.
+        let (text, applied) = view(5);
+        assert_eq!(applied, 5);
+        assert_eq!(text.len(), 10);
+        assert!(text[0].contains("↑ 5 rows"));
+        assert!(text[1].starts_with("line 37") && text[8].starts_with("line 44"));
+        assert!(text[9].contains("q / Esc"));
+
+        // Scrolling past the top stops at the first line.
+        let (text, applied) = view(usize::MAX);
+        assert_eq!(applied, 42);
+        assert!(text[1].starts_with("line 0") && text[8].starts_with("line 7"));
+    }
+
+    #[test]
+    fn scrolling_counts_wrapped_rows_and_short_panels_do_not_scroll() {
+        let mut store = PanelStore::new();
+        store.ingest(&"x".repeat(100));
+        store.ingest("");
+        // 100 chars at 40 per row -> 3 rows, plus one row for the empty line.
+        assert_eq!(panel_total_rows(&store, OTHER_PANEL, 41), 4);
+        assert_eq!(panel_total_rows(&store, "missing", 41), 0);
+
+        // Everything fits on screen, so there is nothing to scroll to.
+        let (_, applied) = render_panel_scrolled(&store, OTHER_PANEL, 41, 10, 7);
+        assert_eq!(applied, 0);
     }
 
     #[test]

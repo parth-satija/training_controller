@@ -28,7 +28,8 @@
 //! ```
 //!
 //! `IDS` is one experiment ID or a comma-separated list (`3,4`): the lines of
-//! all those experiments are drawn in the same graph.
+//! all those experiments are drawn in the same graph. Experiment IDs count per
+//! script, so they are the IDs of the active script's experiments.
 
 use crate::dashboard::{fit, fit_right, run_live_with_keys, Frame};
 use crossterm::event::KeyCode;
@@ -252,7 +253,11 @@ pub fn zip_by_step(xs: &[(i64, f64)], ys: &[(i64, f64)]) -> Vec<(f64, f64)> {
 /// The line of one experiment in one graph.
 #[derive(Debug, Clone)]
 pub struct Track {
+    /// Database ID of the experiment: what the log tables are queried with.
     pub experiment_id: i64,
+    /// The experiment ID users see (its number within its script): what the
+    /// title and the legend show.
+    pub display_id: i64,
     pub points: Vec<(f64, f64)>,
     last_step: i64,
 }
@@ -261,6 +266,7 @@ impl Track {
     fn new(experiment_id: i64) -> Self {
         Self {
             experiment_id,
+            display_id: experiment_id,
             points: Vec::new(),
             last_step: -1,
         }
@@ -304,7 +310,7 @@ impl Plot {
     fn title(&self) -> String {
         let base = format!("{} vs {}", self.spec.y, self.spec.x);
         match self.tracks.as_slice() {
-            [only] => format!("{base} · #{}", only.experiment_id),
+            [only] => format!("{base} · #{}", only.display_id),
             _ => base,
         }
     }
@@ -314,7 +320,7 @@ impl Plot {
             .tracks
             .iter()
             .map(|track| TileSeries {
-                label: format!("#{}", track.experiment_id),
+                label: format!("#{}", track.display_id),
                 points: &track.points,
             })
             .collect();
@@ -373,6 +379,21 @@ impl GraphView {
             running: false,
             error: None,
         })
+    }
+
+    /// Shows `numbers[i]` instead of the database ID `ids[i]` in titles and
+    /// legends: users know experiments by their number within the script.
+    pub fn with_display_ids(mut self, ids: &[i64], numbers: &[i64]) -> Self {
+        for plot in &mut self.plots {
+            for track in &mut plot.tracks {
+                if let Some(index) = ids.iter().position(|&id| id == track.experiment_id) {
+                    if let Some(&number) = numbers.get(index) {
+                        track.display_id = number;
+                    }
+                }
+            }
+        }
+        self
     }
 
     fn experiment_ids(&self) -> Vec<i64> {

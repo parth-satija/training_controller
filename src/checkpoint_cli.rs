@@ -122,8 +122,8 @@ fn metrics_text(entry: &Entry) -> String {
         .join(" ")
 }
 
-fn format_row(entry: &Entry, now: u64) -> String {
-    let experiment = entry.experiment.map_or("-".to_string(), |id| id.to_string());
+fn format_row(entry: &Entry, now: u64, label: &dyn Fn(i64) -> String) -> String {
+    let experiment = entry.experiment.map_or("-".to_string(), |id| label(id));
     let step = entry.step.map_or("-".to_string(), |step| step.to_string());
     format!(
         "{:>4}  {:>4}  {:>8}  {:<8}  {:>9}  {:<8}  {}",
@@ -138,14 +138,17 @@ fn format_row(entry: &Entry, now: u64) -> String {
 }
 
 /// `/checkpoints [EXPERIMENT_ID]`
-pub fn list(script: &str, store: &Store, experiment: Option<&str>) -> Reply {
+///
+/// `experiment` is the database ID that checkpoints record; `label` turns such
+/// an ID into the experiment ID users see (its number within the script).
+pub fn list(
+    script: &str,
+    store: &Store,
+    experiment: Option<i64>,
+    label: &dyn Fn(i64) -> String,
+) -> Reply {
     let mut entries = store.list()?;
-    if let Some(text) = experiment {
-        let id: i64 = text
-            .trim()
-            .trim_start_matches('#')
-            .parse()
-            .map_err(|_| format!("'{text}' is not an experiment id."))?;
+    if let Some(id) = experiment {
         entries.retain(|entry| entry.experiment == Some(id));
     }
     if entries.is_empty() {
@@ -164,7 +167,7 @@ pub fn list(script: &str, store: &Store, experiment: Option<&str>) -> Reply {
         "ID", "EXP", "STEP", "FLAGS", "SIZE", "AGE", "METRICS"
     ));
     for entry in &entries {
-        out.push_str(&format_row(entry, now));
+        out.push_str(&format_row(entry, now, label));
         out.push('\n');
     }
     let total: u64 = entries.iter().map(|entry| entry.size).sum();
@@ -312,6 +315,10 @@ mod tests {
         }
     }
 
+    fn show_id(id: i64) -> String {
+        id.to_string()
+    }
+
     fn save(store: &Store, step: u64, best: bool) {
         let mut metrics = std::collections::BTreeMap::new();
         metrics.insert("loss".to_string(), 1.0 / step as f64);
@@ -362,21 +369,23 @@ mod tests {
     fn list_shows_columns_flags_metrics_and_filters_by_run() {
         let dir = TempDir::new();
         let store = Store::open(&dir.0).unwrap();
-        assert!(list("demo", &store, None).unwrap().contains("No checkpoints stored"));
+        assert!(list("demo", &store, None, &show_id).unwrap().contains("No checkpoints stored"));
 
         save(&store, 100, false);
         save(&store, 200, true);
         pin(&store, "latest", true).unwrap();
 
-        let text = list("demo", &store, None).unwrap();
+        let text = list("demo", &store, None, &show_id).unwrap();
         assert!(text.contains("ID") && text.contains("METRICS"));
         assert!(text.contains("best,pin"));
         assert!(text.contains("loss=0.0100") && text.contains("loss=0.0050"));
         assert!(text.contains("2 checkpoints"));
 
-        assert!(list("demo", &store, Some("4")).unwrap().contains("2 checkpoints"));
-        assert!(list("demo", &store, Some("#9")).unwrap().contains("No checkpoints"));
-        assert!(list("demo", &store, Some("x")).is_err());
+        assert!(list("demo", &store, Some(4), &show_id).unwrap().contains("2 checkpoints"));
+        assert!(list("demo", &store, Some(9), &show_id).unwrap().contains("No checkpoints"));
+        // The EXP column shows the label the caller chooses (the per-script number).
+        let per_script = |id: i64| format!("s{id}");
+        assert!(list("demo", &store, None, &per_script).unwrap().contains("s4"));
     }
 
     #[test]
